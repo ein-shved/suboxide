@@ -32,7 +32,7 @@ pub enum ScanError {
 
 /// Supported audio file extensions.
 pub const AUDIO_EXTENSIONS: &[&str] = &[
-    "mp3", "flac", "ogg", "opus", "m4a", "aac", "wav", "wma", "aiff", "ape", "wv",
+    "mp3", "flac", "ogg", "opus", "m4a", "aac", "wav", "wma", "aiff", "ape", "wv", "cue"
 ];
 
 /// Common cover art filenames to look for in album directories.

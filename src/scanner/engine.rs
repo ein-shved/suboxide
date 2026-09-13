@@ -41,13 +41,20 @@ struct DiscoveredFile {
     path: PathBuf,
     file_size: u64,
     file_modified_at: Option<i64>,
+    master_of: Vec<PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ExistingSong {
-    file_modified_at: Option<i64>,
-    file_size: i64,
-    album_id: Option<i32>,
+#[derive(Debug, Clone)]
+struct ExistingFile {
+    modified_at: Option<i64>,
+    size: i64,
+    r#type: ExistingFileType,
+}
+
+#[derive(Debug, Clone)]
+enum ExistingFileType {
+    LeafFile { master: Option<String> },
+    MasterFile { leafs: HashSet<String> },
 }
 
 enum AutoScanOutcome {
@@ -306,15 +313,22 @@ impl Scanner {
             s.set_phase(ScanPhase::Discovering);
         }
 
-        // Get existing songs in this folder for incremental scanning
-        let existing_songs = self.get_existing_songs(folder.id)?;
+        // Get existing files in this folder for incremental scanning
+        let existing_files = self.get_existing_files(folder.id)?;
 
         // Collect all audio files on disk
         let (discovered_files, discovered_paths) = Self::discover_files_with_paths(folder_path);
         result.tracks_found = discovered_files.len();
 
+        // Find deleted files (in database but not on disk)
+        let deleted_paths: HashMap<_, _> = existing_files
+            .iter()
+            .filter(|(path, _)| !discovered_paths.contains(*path))
+            .map(|(path, file)| (path.clone(), file.clone()))
+            .collect();
+
         let (files_to_process, skipped_unchanged) =
-            Self::split_discovered_files_for_mode(discovered_files, &existing_songs, mode);
+            Self::split_discovered_files_for_mode(discovered_files, &existing_files, mode);
 
         // Set total count now that we know how many files to process
         if let Some(s) = state {
@@ -348,17 +362,10 @@ impl Scanner {
             )
             .collect();
 
-        // Find deleted files (in database but not on disk)
-        let deleted_paths: Vec<_> = existing_songs
-            .keys()
-            .filter(|path| !discovered_paths.contains(*path))
-            .cloned()
-            .collect();
-
         if !deleted_paths.is_empty() {
             let dirty_album_ids: HashSet<i32> = deleted_paths
                 .iter()
-                .filter_map(|path| existing_songs.get(path).and_then(|song| song.album_id))
+                .filter_map(|path| existing_files.get(path).and_then(|song| song.album_id))
                 .collect();
             println!(
                 "  Removing {} deleted files from database",
@@ -372,7 +379,7 @@ impl Scanner {
         let processed = self.process_tracks_with_options(
             folder,
             tracks,
-            &existing_songs,
+            &existing_files,
             state,
             skipped_unchanged,
         )?;
@@ -389,38 +396,92 @@ impl Scanner {
     }
 
     /// Get existing songs in a folder from the database.
-    fn get_existing_songs(
+    fn get_existing_files(
         &self,
         folder_id: i32,
-    ) -> Result<HashMap<String, ExistingSong>, ScanError> {
-        use crate::db::schema::songs;
+    ) -> Result<HashMap<String, ExistingFile>, ScanError> {
+        use crate::db::schema::files;
         use diesel::prelude::*;
 
         let mut conn = self.pool.get().map_err(MusicRepoError::from)?;
-        let existing = songs::table
-            .filter(songs::music_folder_id.eq(folder_id))
+        /*
+                select f.*, mstr.*
+                from files f
+                left join files mstr on f.master = mstr.id
+                where f.foulderId = ?
+
+
+        let results = emp
+                .left_join(
+                    supervisor.on(emp
+                        .field(employees::supervisor_id)
+                        .eq(supervisor.field(employees::id).nullable()))
+                )
+                .select((
+                    emp.fields((employees::id, employees::name, employees::supervisor_id)),
+                    // Fields from the right side of a LEFT JOIN must be explicitly .nullable()
+                    supervisor.fields((employees::id, employees::name, employees::supervisor_id)).nullable(),
+                ))
+                .load::<(Employee, Option<Employee>)>(conn)?;
+                 */
+        let (master, file) = diesel::alias!(files as master, files as file);
+        let existing = file
+            .left_join(
+                master.on(file
+                    .field(files::master)
+                    .eq(master.field(files::id).nullable())),
+            )
+            .filter(file.field(files::music_folder_id).eq(folder_id))
             .select((
-                songs::path,
-                songs::file_modified_at,
-                songs::file_size,
-                songs::album_id,
+                file.fields((files::path, files::modified_at, files::size)),
+                master.field(files::path).nullable(),
             ))
             .load(&mut conn)
             .map_err(MusicRepoError::from)?;
 
-        Ok(existing
-            .into_iter()
-            .map(|(path, file_modified_at, file_size, album_id)| {
-                (
-                    path,
-                    ExistingSong {
-                        file_modified_at,
-                        file_size,
-                        album_id,
-                    },
-                )
-            })
-            .collect())
+        let mut map = HashMap::new();
+        for ((path, modified_at, size), master) in existing.into_iter() {
+            use std::collections::hash_map::Entry;
+            let master: Option<String> = master;
+            let path: String = path;
+
+            if let Some(mater_path) = master.clone() {
+                match map.entry(mater_path) {
+                    Entry::Occupied(mut file) => {
+                        let file: &mut ExistingFile = file.get_mut();
+                        file.add_leaf(path.clone());
+                    }
+                    Entry::Vacant(vacant_entry) => {
+                        vacant_entry.insert(ExistingFile {
+                            r#type: ExistingFileType::MasterFile {
+                                leafs: std::iter::once(path.clone()).collect(),
+                            },
+                            modified_at: None,
+                            size: 0,
+                        });
+                    }
+                }
+            }
+            match map.entry(path) {
+                Entry::Occupied(mut file) => {
+                    let file: &mut ExistingFile = file.get_mut();
+                    file.modified_at = modified_at;
+                    file.size = size;
+                }
+                Entry::Vacant(vacant_entry) => {
+                    vacant_entry.insert(ExistingFile {
+                        modified_at,
+                        size,
+                        r#type: ExistingFileType::LeafFile {
+                            master: (master as Option<String>).clone(),
+                        },
+                    });
+                }
+            }
+
+        }
+
+        Ok(map)
     }
 
     /// Remove songs that no longer exist on disk.
@@ -519,6 +580,7 @@ impl Scanner {
                     path,
                     file_size: metadata.len(),
                     file_modified_at,
+                    master_of: Default::default(),
                 })
             })
             .collect();
@@ -528,11 +590,11 @@ impl Scanner {
 
     fn split_discovered_files_for_mode(
         discovered_files: Vec<DiscoveredFile>,
-        existing_songs: &HashMap<String, ExistingSong>,
+        existing_songs: &HashMap<String, ExistingFile>,
         mode: ScanMode,
-    ) -> (Vec<DiscoveredFile>, usize) {
+    ) -> (HashSet<DiscoveredFile>, usize) {
         if mode == ScanMode::Full {
-            return (discovered_files, 0);
+            return (discovered_files.iter().collect(), 0);
         }
 
         let mut to_process = Vec::with_capacity(discovered_files.len());
@@ -543,8 +605,8 @@ impl Scanner {
             let unchanged = existing_songs
                 .get(path_str.as_ref())
                 .is_some_and(|stored| {
-                    matches!((stored.file_modified_at, file.file_modified_at), (Some(stored), Some(current)) if stored == current)
-                        && stored.file_size == i64::try_from(file.file_size).unwrap_or(i64::MAX)
+                    matches!((stored.modified_at, file.file_modified_at), (Some(stored), Some(current)) if stored == current)
+                        && stored.size == i64::try_from(file.file_size).unwrap_or(i64::MAX)
                 });
 
             if unchanged {
@@ -681,7 +743,7 @@ impl Scanner {
         &self,
         folder: &MusicFolder,
         tracks: Vec<ScannedTrack>,
-        existing_songs: &HashMap<String, ExistingSong>,
+        existing_songs: &HashMap<String, ExistingFile>,
         state: Option<&ScanState>,
         initial_tracks_skipped: usize,
     ) -> Result<ScanResult, ScanError> {
@@ -1234,12 +1296,24 @@ impl AutoScanHandle {
     }
 }
 
+impl ExistingFile {
+    fn add_leaf(&mut self, leaf: String) {
+        if let ExistingFileType::MasterFile { ref mut leafs } = self.r#type {
+            leafs.insert(leaf);
+        } else {
+            self.r#type = ExistingFileType::MasterFile {
+                leafs: (leaf,).collect(),
+            };
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
 
-    use super::{DiscoveredFile, ExistingSong, ScanMode, Scanner};
+    use super::{DiscoveredFile, ExistingFile, ScanMode, Scanner};
 
     fn discovered(path: &str, file_modified_at: Option<i64>) -> DiscoveredFile {
         DiscoveredFile {
@@ -1260,17 +1334,17 @@ mod tests {
         let existing = HashMap::from([
             (
                 "/music/unchanged.mp3".to_string(),
-                ExistingSong {
-                    file_modified_at: Some(100),
-                    file_size: 123,
+                ExistingFile {
+                    modified_at: Some(100),
+                    size: 123,
                     album_id: None,
                 },
             ),
             (
                 "/music/changed.mp3".to_string(),
-                ExistingSong {
-                    file_modified_at: Some(150),
-                    file_size: 123,
+                ExistingFile {
+                    modified_at: Some(150),
+                    size: 123,
                     album_id: None,
                 },
             ),
@@ -1305,9 +1379,9 @@ mod tests {
 
         let existing = HashMap::from([(
             "/music/one.mp3".to_string(),
-            ExistingSong {
-                file_modified_at: Some(10),
-                file_size: 123,
+            ExistingFile {
+                modified_at: Some(10),
+                size: 123,
                 album_id: None,
             },
         )]);

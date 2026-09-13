@@ -87,15 +87,12 @@ diesel::table! {
     songs (id) {
         id -> Integer,
         title -> Text,
+        file_id -> Integer,
         sort_name -> Nullable<Text>,
         album_id -> Nullable<Integer>,
         artist_id -> Nullable<Integer>,
         artist_name -> Nullable<Text>,
         album_name -> Nullable<Text>,
-        music_folder_id -> Integer,
-        path -> Text,
-        parent_path -> Text,
-        file_size -> BigInt,
         content_type -> Text,
         suffix -> Text,
         duration -> Integer,
@@ -110,9 +107,21 @@ diesel::table! {
         cover_art -> Nullable<Text>,
         musicbrainz_id -> Nullable<Text>,
         play_count -> Integer,
-        file_modified_at -> Nullable<BigInt>,
+    }
+}
+
+diesel::table! {
+    files (id) {
+        id -> Integer,
+        path -> Text,
+        parent_path -> Text,
+        size -> BigInt,
+        music_folder_id -> Integer,
+        content_type -> Text,
+        modified_at -> Nullable<BigInt>,
         created_at -> Timestamp,
         updated_at -> Timestamp,
+        master -> Nullable<Integer>,
     }
 }
 
@@ -210,7 +219,8 @@ diesel::joinable!(albums -> artists (artist_id));
 diesel::joinable!(artist_lastfm_info -> artists (artist_id));
 diesel::joinable!(songs -> albums (album_id));
 diesel::joinable!(songs -> artists (artist_id));
-diesel::joinable!(songs -> music_folders (music_folder_id));
+diesel::joinable!(songs -> files (file_id));
+diesel::joinable!(files -> music_folders (music_folder_id));
 diesel::joinable!(starred -> users (user_id));
 diesel::joinable!(now_playing -> users (user_id));
 diesel::joinable!(now_playing -> songs (song_id));
@@ -230,6 +240,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     artists,
     albums,
     songs,
+    files,
     starred,
     now_playing,
     scrobbles,
