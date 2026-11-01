@@ -1,0 +1,24 @@
+schema: ./schemas/sdd/schema.yaml
+workspaces:
+  default:
+    specs:
+      adapter: fs
+      fs:
+        path: specs/
+storage:
+  changes:
+    adapter: fs
+    fs:
+      path: .specd/changes/
+  drafts:
+    adapter: fs
+    fs:
+      path: .specd/drafts/
+  discarded:
+    adapter: fs
+    fs:
+      path: .specd/discarded/
+  archive:
+    adapter: fs
+    fs:
+      path: .specd/archive/

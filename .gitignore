@@ -4,3 +4,6 @@
 /open-subsonic-api
 subsonic.db-shm
 subsonic.db-wal
+specd.local.yaml
+.codex
+.specd
