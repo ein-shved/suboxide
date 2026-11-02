@@ -143,6 +143,7 @@ mod tests {
             album_name: Some("Album".into()),
             music_folder_id: 1,
             path: format!("/music/song{id}.flac"),
+            cue_track_id: None,
             parent_path: "/music".into(),
             file_size: 100,
             content_type: "audio/flac".into(),

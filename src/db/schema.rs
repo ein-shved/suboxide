@@ -115,8 +115,32 @@ diesel::table! {
         search_name -> Text,
         play_count -> Integer,
         file_modified_at -> Nullable<BigInt>,
+        cue_track_id -> Nullable<Integer>,
         created_at -> Timestamp,
         updated_at -> Timestamp,
+    }
+}
+
+diesel::table! {
+    cue_sources (id) {
+        id -> Integer,
+        sheet_path -> Text,
+        cue_content -> Text,
+        image_size -> BigInt,
+        image_modified_seconds -> BigInt,
+        image_modified_nanos -> Integer,
+    }
+}
+
+diesel::table! {
+    cue_tracks (id) {
+        id -> Integer,
+        cue_source_id -> Integer,
+        track_number -> Integer,
+        start_frame -> BigInt,
+        end_frame -> BigInt,
+        byte_start -> BigInt,
+        byte_end -> BigInt,
     }
 }
 
@@ -283,6 +307,8 @@ diesel::joinable!(artist_lastfm_info -> artists (artist_id));
 diesel::joinable!(songs -> albums (album_id));
 diesel::joinable!(songs -> artists (artist_id));
 diesel::joinable!(songs -> music_folders (music_folder_id));
+diesel::joinable!(songs -> cue_tracks (cue_track_id));
+diesel::joinable!(cue_tracks -> cue_sources (cue_source_id));
 diesel::joinable!(starred -> users (user_id));
 diesel::joinable!(now_playing -> users (user_id));
 diesel::joinable!(now_playing -> songs (song_id));
@@ -305,6 +331,8 @@ diesel::allow_tables_to_appear_in_same_query!(
     artists,
     albums,
     songs,
+    cue_sources,
+    cue_tracks,
     starred,
     now_playing,
     scrobbles,

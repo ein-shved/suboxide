@@ -128,12 +128,90 @@ impl CustomizeConnection<SqliteConnection, diesel::r2d2::Error> for SqliteConnec
 
 /// Create the current database schema and indexes if they do not exist.
 ///
-/// Existing databases must already use this schema; alpha schema upgrades are
-/// not performed here.
+/// Upgrade the previous song schema in place, preserving IDs and references.
 pub fn initialize_database(conn: &mut SqliteConnection) -> Result<(), diesel::result::Error> {
+    // SQLite table rebuilding requires foreign keys disabled outside the
+    // transaction. Restore the caller's setting on both success and failure.
+    #[derive(QueryableByName)]
+    struct ForeignKeys {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        foreign_keys: i32,
+    }
     diesel::sql_query("PRAGMA journal_mode = WAL").execute(conn)?;
-    conn.transaction(initialize_schema)
+    let enabled = diesel::sql_query("PRAGMA foreign_keys")
+        .get_result::<ForeignKeys>(conn)?
+        .foreign_keys
+        != 0;
+    diesel::sql_query("PRAGMA foreign_keys = OFF").execute(conn)?;
+    let result = conn.transaction(initialize_schema);
+    if enabled {
+        diesel::sql_query("PRAGMA foreign_keys = ON").execute(conn)?;
+    }
+    result
 }
+
+fn upgrade_cue_songs(conn: &mut SqliteConnection) -> Result<(), diesel::result::Error> {
+    #[derive(QueryableByName)]
+    struct Column {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        name: String,
+    }
+    let columns =
+        diesel::sql_query("SELECT name FROM pragma_table_info('songs')").load::<Column>(conn)?;
+    if columns.iter().any(|column| column.name == "cue_track_id") {
+        return Ok(());
+    }
+    // Reuse the current table definition; copy every old column explicitly so
+    // the added nullable CUE identity receives NULL for ordinary songs.
+    let column_names = columns
+        .iter()
+        .map(|column| format!("\"{}\"", column.name.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    diesel::sql_query(SONGS_TABLE.replace("IF NOT EXISTS songs", "songs_cue_upgrade"))
+        .execute(conn)?;
+    diesel::sql_query(format!(
+        "INSERT INTO songs_cue_upgrade ({column_names}) SELECT {column_names} FROM songs"
+    ))
+    .execute(conn)?;
+    diesel::sql_query("DROP TABLE songs").execute(conn)?;
+    diesel::sql_query("ALTER TABLE songs_cue_upgrade RENAME TO songs").execute(conn)?;
+    Ok(())
+}
+
+const SONGS_TABLE: &str = r"
+        CREATE TABLE IF NOT EXISTS songs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+            title TEXT NOT NULL,
+            sort_name TEXT,
+            album_id INTEGER REFERENCES albums(id),
+            artist_id INTEGER REFERENCES artists(id),
+            artist_name TEXT,
+            album_name TEXT,
+            music_folder_id INTEGER NOT NULL REFERENCES music_folders(id),
+            path TEXT NOT NULL,
+            cue_track_id INTEGER UNIQUE REFERENCES cue_tracks(id) DEFERRABLE INITIALLY DEFERRED,
+            parent_path TEXT NOT NULL,
+            file_size BIGINT NOT NULL DEFAULT 0,
+            content_type TEXT NOT NULL,
+            suffix TEXT NOT NULL,
+            duration INTEGER NOT NULL DEFAULT 0,
+            bit_rate INTEGER,
+            bit_depth INTEGER,
+            sampling_rate INTEGER,
+            channel_count INTEGER,
+            track_number INTEGER,
+            disc_number INTEGER,
+            year INTEGER,
+            genre TEXT,
+            cover_art TEXT,
+            musicbrainz_id TEXT,
+            search_name TEXT NOT NULL DEFAULT '',
+            play_count INTEGER NOT NULL DEFAULT 0,
+            file_modified_at BIGINT,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )";
 
 #[expect(
     clippy::too_many_lines,
@@ -262,43 +340,31 @@ fn initialize_schema(conn: &mut SqliteConnection) -> Result<(), diesel::result::
     diesel::sql_query("CREATE INDEX IF NOT EXISTS idx_albums_artist_id ON albums(artist_id)")
         .execute(conn)?;
 
-    // Create songs table
+    // Create or upgrade songs before recreating their indexes.
+    diesel::sql_query("CREATE TABLE IF NOT EXISTS cue_sources (
+        id INTEGER PRIMARY KEY NOT NULL,
+        sheet_path TEXT NOT NULL UNIQUE,
+        cue_content TEXT NOT NULL,
+        image_size BIGINT NOT NULL CHECK (image_size > 0),
+        image_modified_seconds BIGINT NOT NULL CHECK (image_modified_seconds >= 0),
+        image_modified_nanos INTEGER NOT NULL CHECK (image_modified_nanos >= 0 AND image_modified_nanos < 1000000000)
+    )").execute(conn)?;
     diesel::sql_query(
-        r"
-        CREATE TABLE IF NOT EXISTS songs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
-            title TEXT NOT NULL,
-            sort_name TEXT,
-            album_id INTEGER REFERENCES albums(id),
-            artist_id INTEGER REFERENCES artists(id),
-            artist_name TEXT,
-            album_name TEXT,
-            music_folder_id INTEGER NOT NULL REFERENCES music_folders(id),
-            path TEXT NOT NULL UNIQUE,
-            parent_path TEXT NOT NULL,
-            file_size BIGINT NOT NULL DEFAULT 0,
-            content_type TEXT NOT NULL,
-            suffix TEXT NOT NULL,
-            duration INTEGER NOT NULL DEFAULT 0,
-            bit_rate INTEGER,
-            bit_depth INTEGER,
-            sampling_rate INTEGER,
-            channel_count INTEGER,
-            track_number INTEGER,
-            disc_number INTEGER,
-            year INTEGER,
-            genre TEXT,
-            cover_art TEXT,
-            musicbrainz_id TEXT,
-            search_name TEXT NOT NULL DEFAULT '',
-            play_count INTEGER NOT NULL DEFAULT 0,
-            file_modified_at BIGINT,
-            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )
-        ",
+        "CREATE TABLE IF NOT EXISTS cue_tracks (
+        id INTEGER PRIMARY KEY NOT NULL,
+        cue_source_id INTEGER NOT NULL REFERENCES cue_sources(id) DEFERRABLE INITIALLY DEFERRED,
+        track_number INTEGER NOT NULL CHECK (track_number > 0),
+        start_frame BIGINT NOT NULL CHECK (start_frame >= 0),
+        end_frame BIGINT NOT NULL CHECK (end_frame > start_frame),
+        byte_start BIGINT NOT NULL CHECK (byte_start >= 0),
+        byte_end BIGINT NOT NULL CHECK (byte_end > byte_start),
+        UNIQUE (cue_source_id, track_number)
+    )",
     )
     .execute(conn)?;
+    diesel::sql_query(SONGS_TABLE).execute(conn)?;
+    upgrade_cue_songs(conn)?;
+    diesel::sql_query("CREATE UNIQUE INDEX IF NOT EXISTS idx_songs_file_identity ON songs(path) WHERE cue_track_id IS NULL").execute(conn)?;
 
     diesel::sql_query("CREATE INDEX IF NOT EXISTS idx_songs_title ON songs(title)")
         .execute(conn)?;
@@ -699,6 +765,141 @@ fn initialize_schema(conn: &mut SqliteConnection) -> Result<(), diesel::result::
 mod tests {
     use super::*;
     use diesel::connection::SimpleConnection;
+
+    fn create_legacy_songs(conn: &mut SqliteConnection) {
+        // Build exactly the previous songs schema with the path UNIQUE key.
+        conn.batch_execute("PRAGMA foreign_keys = OFF; DROP TABLE songs;")
+            .expect("old table setup");
+        let old = SONGS_TABLE.replace(
+            "            path TEXT NOT NULL,",
+            "            path TEXT NOT NULL UNIQUE,",
+        );
+        let begin = old
+            .find("            cue_track_id INTEGER")
+            .expect("cue column");
+        let end = old
+            .find("            parent_path TEXT")
+            .expect("next column");
+        let old = format!("{}{}", &old[..begin], &old[end..]);
+        conn.batch_execute(&old).expect("legacy schema");
+        conn.batch_execute("PRAGMA foreign_keys = ON;
+            INSERT INTO users (id, username, password_hash) VALUES (1, 'listener', 'hash');
+            INSERT INTO music_folders (id, name, path) VALUES (1, 'music', '/music');
+            INSERT INTO songs (id, title, music_folder_id, path, parent_path, content_type, suffix, play_count)
+              VALUES (42, 'Original', 1, '/music/image.flac', '/music', 'audio/flac', 'flac', 9);
+            INSERT INTO playlists (id, user_id, name) VALUES (1, 1, 'Saved');
+            INSERT INTO playlist_songs (playlist_id, song_id, position) VALUES (1, 42, 0);
+            INSERT INTO play_queue (id, user_id) VALUES (1, 1);
+            INSERT INTO play_queue_songs (play_queue_id, song_id, position) VALUES (1, 42, 0);
+            INSERT INTO bookmarks (user_id, song_id, position) VALUES (1, 42, 1234);
+        ").expect("legacy data");
+    }
+
+    #[test]
+    fn cue_upgrade_preserves_song_ids_and_personal_references() {
+        use crate::db::schema::{bookmarks, play_queue_songs, playlist_songs, songs};
+        let mut conn = SqliteConnection::establish(":memory:").expect("connection");
+        initialize_database(&mut conn).expect("tables");
+        create_legacy_songs(&mut conn);
+        initialize_database(&mut conn).expect("upgrade");
+        initialize_database(&mut conn).expect("idempotent initialization");
+        assert_eq!(
+            songs::table
+                .find(42)
+                .select((songs::title, songs::play_count, songs::cue_track_id))
+                .first::<(String, i32, Option<i32>)>(&mut conn)
+                .expect("preserved row"),
+            ("Original".to_owned(), 9, None)
+        );
+        assert_eq!(
+            playlist_songs::table
+                .select(playlist_songs::song_id)
+                .first::<i32>(&mut conn)
+                .expect("playlist"),
+            42
+        );
+        assert_eq!(
+            play_queue_songs::table
+                .select(play_queue_songs::song_id)
+                .first::<i32>(&mut conn)
+                .expect("queue"),
+            42
+        );
+        assert_eq!(
+            bookmarks::table
+                .select((bookmarks::song_id, bookmarks::position))
+                .first::<(i32, i64)>(&mut conn)
+                .expect("bookmark"),
+            (42, 1234)
+        );
+        assert!(
+            diesel::insert_into(bookmarks::table)
+                .values((
+                    bookmarks::user_id.eq(1),
+                    bookmarks::song_id.eq(999),
+                    bookmarks::position.eq(0)
+                ))
+                .execute(&mut conn)
+                .is_err(),
+            "foreign key enforcement restored"
+        );
+    }
+
+    #[test]
+    fn cue_relations_enforce_identity_intervals_and_deferred_replacement() {
+        let mut conn = SqliteConnection::establish(":memory:").expect("connection");
+        initialize_database(&mut conn).expect("tables");
+        conn.batch_execute("PRAGMA foreign_keys = ON;
+            INSERT INTO cue_sources VALUES (1, '/music/a.cue', 'sheet', 1000, 1, 999999999);
+            INSERT INTO cue_tracks VALUES (1, 1, 1, 0, 1, 42, 1000);
+            INSERT INTO music_folders (id, name, path) VALUES (1, 'Music', '/music');
+            INSERT INTO songs (id, title, music_folder_id, path, parent_path, content_type, suffix, cue_track_id)
+                VALUES (1, 'Track', 1, '/music/image.flac', '/music', 'audio/flac', 'flac', 1);
+            INSERT INTO songs (id, title, music_folder_id, path, parent_path, content_type, suffix)
+                VALUES (2, 'File', 1, '/music/image.flac', '/music', 'audio/flac', 'flac');
+        ").expect("typed source and distinct ordinary identity");
+        for statement in [
+            "INSERT INTO cue_sources VALUES (2, '/music/a.cue', '', 1000, 1, 0)",
+            "INSERT INTO cue_sources VALUES (2, '/music/b.cue', '', 0, 1, 0)",
+            "INSERT INTO cue_sources VALUES (2, '/music/b.cue', '', 1, -1, 0)",
+            "INSERT INTO cue_sources VALUES (2, '/music/b.cue', '', 1, 1, -1)",
+            "INSERT INTO cue_sources VALUES (2, '/music/b.cue', '', 1, 1, 1000000000)",
+            "INSERT INTO cue_tracks VALUES (2, 1, 1, 1, 2, 100, 200)",
+            "INSERT INTO cue_tracks VALUES (2, 1, 0, 1, 2, 100, 200)",
+            "INSERT INTO cue_tracks VALUES (2, 1, 2, -1, 2, 100, 200)",
+            "INSERT INTO cue_tracks VALUES (2, 1, 2, 1, 1, 100, 200)",
+            "INSERT INTO cue_tracks VALUES (2, 1, 2, 1, 2, -1, 200)",
+            "INSERT INTO cue_tracks VALUES (2, 1, 2, 1, 2, 100, 100)",
+            "INSERT INTO cue_tracks VALUES (2, 999, 2, 1, 2, 100, 200)",
+            "UPDATE songs SET cue_track_id = 1 WHERE id = 2",
+            "UPDATE songs SET cue_track_id = 999 WHERE id = 2",
+            "INSERT INTO songs (title, music_folder_id, path, parent_path, content_type, suffix) VALUES ('Duplicate', 1, '/music/image.flac', '/music', 'audio/flac', 'flac')",
+            "DELETE FROM cue_sources WHERE id = 1",
+            "DELETE FROM cue_tracks WHERE id = 1",
+        ] {
+            assert!(
+                conn.batch_execute(statement).is_err(),
+                "must reject: {statement}"
+            );
+        }
+        conn.transaction::<_, diesel::result::Error, _>(|conn| {
+            conn.batch_execute(
+                "DELETE FROM cue_sources WHERE id = 1;
+                DELETE FROM cue_tracks WHERE id = 1;
+                INSERT INTO cue_tracks VALUES (1, 1, 1, 2, 4, 100, 900);
+                INSERT INTO cue_sources VALUES (1, '/music/a.cue', 'replacement', 1000, 2, 0);",
+            )
+        })
+        .expect("deferred NO ACTION allows same-ID replacement");
+        assert_eq!(
+            crate::db::schema::songs::table
+                .find(1)
+                .select(crate::db::schema::songs::cue_track_id)
+                .first::<Option<i32>>(&mut conn)
+                .expect("song reference"),
+            Some(1)
+        );
+    }
 
     #[test]
     fn initialization_creates_current_schema_and_preserves_existing_rows() {

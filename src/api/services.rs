@@ -189,6 +189,19 @@ impl MusicLibrary {
         MusicFolderRepository::new(self.pool.clone()).find_enabled()
     }
 
+    pub(in crate::api) fn media_roots(
+        &self,
+    ) -> Result<Vec<crate::models::music::MusicFolder>, MusicRepoError> {
+        MusicFolderRepository::new(self.pool.clone()).find_all()
+    }
+
+    pub(in crate::api) fn audio_source(
+        &self,
+        song_id: i32,
+    ) -> Result<Option<crate::db::repo::music::SongAudioSource>, MusicRepoError> {
+        SongRepository::new(self.pool.clone()).audio_source(song_id)
+    }
+
     pub(in crate::api) fn get_music_folder(
         &self,
         id: i32,
@@ -1690,6 +1703,7 @@ mod tests {
             album_name: Some("Album".into()),
             music_folder_id: 1,
             path: format!("/music/song{id}.flac"),
+            cue_track_id: None,
             parent_path: "/music".into(),
             file_size: 100,
             content_type: "audio/flac".into(),

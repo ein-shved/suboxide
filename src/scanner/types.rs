@@ -33,6 +33,12 @@ pub enum ScanError {
     Metadata { path: PathBuf, message: String },
 }
 
+impl From<diesel::result::Error> for ScanError {
+    fn from(error: diesel::result::Error) -> Self {
+        Self::Database(error.into())
+    }
+}
+
 /// Supported audio file extensions.
 pub const AUDIO_EXTENSIONS: &[&str] = &[
     "mp3", "flac", "ogg", "opus", "m4a", "aac", "wav", "wma", "aiff", "ape", "wv",
@@ -82,6 +88,7 @@ pub enum ScanTarget {
 #[derive(Debug, Clone)]
 pub struct ScannedTrack {
     pub path: PathBuf,
+    pub cue_track: Option<crate::models::music::CueTrackSource>,
     pub parent_path: PathBuf,
     pub file_size: u64,
     pub content_type: String,
@@ -110,7 +117,8 @@ pub(crate) struct PreparedTrack {
     pub artist_id: Option<i32>,
     pub album_id: Option<i32>,
     pub cover_art: Option<String>,
-    pub is_update: bool,
+    pub identity: crate::models::music::SongIdentity,
+    pub song_id: Option<i32>,
 }
 
 /// Result of scanning a music folder.

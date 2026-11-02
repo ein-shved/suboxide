@@ -169,6 +169,7 @@ impl MusicFolderRepository {
                 .execute(conn)?;
             diesel::delete(music_folders::table.find(folder_id)).execute(conn)?;
             reconcile_albums(conn, &albums)?;
+            cleanup_cue_sources(conn)?;
             Ok(true)
         })
     }
@@ -897,6 +898,7 @@ pub struct SongRow {
     pub album_name: Option<String>,
     pub music_folder_id: i32,
     pub path: String,
+    pub cue_track_id: Option<i32>,
     pub parent_path: String,
     pub file_size: i64,
     pub content_type: String,
@@ -929,6 +931,7 @@ impl From<SongRow> for Song {
             album_name: row.album_name,
             music_folder_id: row.music_folder_id,
             path: row.path,
+            cue_track_id: row.cue_track_id,
             parent_path: row.parent_path,
             file_size: row.file_size,
             content_type: row.content_type,
@@ -951,6 +954,26 @@ impl From<SongRow> for Song {
     }
 }
 
+#[derive(Debug)]
+pub struct SongAudioSource {
+    pub song: Song,
+    pub cue: Option<(
+        crate::models::music::CueTrack,
+        crate::models::music::CueSource,
+    )>,
+}
+
+fn invalid_cue(error: impl std::fmt::Display) -> MusicRepoError {
+    MusicRepoError::new(MusicRepoErrorKind::InvalidInput, error.to_string())
+}
+
+/// Remove dependent tracks before their unreferenced sources, in the caller's transaction.
+pub fn cleanup_cue_sources(conn: &mut SqliteConnection) -> Result<(), diesel::result::Error> {
+    diesel::sql_query("DELETE FROM cue_tracks WHERE NOT EXISTS (SELECT 1 FROM songs WHERE songs.cue_track_id = cue_tracks.id)").execute(conn)?;
+    diesel::sql_query("DELETE FROM cue_sources WHERE NOT EXISTS (SELECT 1 FROM cue_tracks WHERE cue_tracks.cue_source_id = cue_sources.id)").execute(conn)?;
+    Ok(())
+}
+
 /// Repository for song database operations.
 #[derive(Clone, Debug)]
 pub struct SongRepository {
@@ -958,6 +981,198 @@ pub struct SongRepository {
 }
 
 impl SongRepository {
+    /// Stage source metadata inside the directory publication transaction.
+    pub fn put_cue_source(
+        conn: &mut SqliteConnection,
+        sheet_path: &str,
+        source: &crate::flac::CueSource,
+    ) -> Result<(), MusicRepoError> {
+        use crate::db::schema::cue_sources;
+        let size = i64::try_from(source.fingerprint.size).map_err(invalid_cue)?;
+        let seconds =
+            i64::try_from(source.fingerprint.modified_ns / 1_000_000_000).map_err(invalid_cue)?;
+        let nanos =
+            i32::try_from(source.fingerprint.modified_ns % 1_000_000_000).map_err(invalid_cue)?;
+        let values = (
+            cue_sources::cue_content.eq(&source.cue_content),
+            cue_sources::image_size.eq(size),
+            cue_sources::image_modified_seconds.eq(seconds),
+            cue_sources::image_modified_nanos.eq(nanos),
+        );
+        diesel::insert_into(cue_sources::table)
+            .values((cue_sources::sheet_path.eq(sheet_path), values))
+            .on_conflict(cue_sources::sheet_path)
+            .do_update()
+            .set(values)
+            .execute(conn)?;
+        Ok(())
+    }
+
+    /// Load typed metadata without a persisted frame map.
+    pub fn cue_source(
+        &self,
+        sheet_path: &str,
+    ) -> Result<Option<crate::models::music::CueSource>, MusicRepoError> {
+        use crate::db::schema::cue_sources;
+        let mut conn = self.pool.get()?;
+        Ok(cue_sources::table
+            .filter(cue_sources::sheet_path.eq(sheet_path))
+            .select(crate::models::music::CueSource::as_select())
+            .first(&mut conn)
+            .optional()?)
+    }
+
+    /// Retain the relational identity while replacing its indexed boundaries.
+    pub fn put_cue_track(
+        conn: &mut SqliteConnection,
+        cue: &crate::models::music::CueTrackSource,
+    ) -> Result<i32, MusicRepoError> {
+        use crate::db::schema::{cue_sources, cue_tracks};
+        let source_id: i32 = cue_sources::table
+            .filter(cue_sources::sheet_path.eq(&cue.sheet_path))
+            .select(cue_sources::id)
+            .first(conn)?;
+        let number = i32::try_from(cue.number).map_err(invalid_cue)?;
+        let values = (
+            cue_tracks::start_frame.eq(i64::try_from(cue.frames.start).map_err(invalid_cue)?),
+            cue_tracks::end_frame.eq(i64::try_from(cue.frames.end).map_err(invalid_cue)?),
+            cue_tracks::byte_start.eq(i64::try_from(cue.bytes.start).map_err(invalid_cue)?),
+            cue_tracks::byte_end.eq(i64::try_from(cue.bytes.end).map_err(invalid_cue)?),
+        );
+        diesel::insert_into(cue_tracks::table)
+            .values((
+                cue_tracks::cue_source_id.eq(source_id),
+                cue_tracks::track_number.eq(number),
+                values,
+            ))
+            .on_conflict((cue_tracks::cue_source_id, cue_tracks::track_number))
+            .do_update()
+            .set(values)
+            .execute(conn)?;
+        Ok(cue_tracks::table
+            .filter(cue_tracks::cue_source_id.eq(source_id))
+            .filter(cue_tracks::track_number.eq(number))
+            .select(cue_tracks::id)
+            .first(conn)?)
+    }
+
+    /// Song and source references are read from one SQLite snapshot.
+    pub fn audio_source(&self, song_id: i32) -> Result<Option<SongAudioSource>, MusicRepoError> {
+        use crate::db::schema::{cue_sources, cue_tracks};
+        use crate::models::music::{CueSource, CueTrack};
+        let mut conn = self.pool.get()?;
+        conn.transaction(|conn| {
+            let Some(row) = songs::table
+                .find(song_id)
+                .select(SongRow::as_select())
+                .first::<SongRow>(conn)
+                .optional()?
+            else {
+                return Ok(None);
+            };
+            let song = Song::from(row);
+            let cue = song
+                .cue_track_id
+                .map(|id| {
+                    cue_tracks::table
+                        .find(id)
+                        .inner_join(cue_sources::table)
+                        .select((CueTrack::as_select(), CueSource::as_select()))
+                        .first::<(CueTrack, CueSource)>(conn)
+                })
+                .transpose()?;
+            Ok(Some(SongAudioSource { song, cue }))
+        })
+    }
+
+    /// Validate staged replacements against their temporary native index.
+    pub fn validate_cue_publication(
+        conn: &mut SqliteConnection,
+        sheet_path: &str,
+        source: &crate::flac::CueSource,
+    ) -> Result<(), MusicRepoError> {
+        use crate::db::schema::{cue_sources, cue_tracks};
+        use crate::models::music::CueTrack;
+        #[derive(QueryableByName)]
+        struct Conflict {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            count: i64,
+        }
+        let sheet =
+            crate::scanner::cue::CueSheet::parse(&source.cue_content).map_err(invalid_cue)?;
+        let sheet_path = std::path::Path::new(sheet_path);
+        let image = std::path::Path::new(&source.image_path);
+        if !sheet_path.is_absolute()
+            || !image.is_absolute()
+            || sheet_path.with_file_name(&sheet.image) != image
+        {
+            return Err(invalid_cue(
+                "CUE image must be the sheet's same-directory source",
+            ));
+        }
+        let expected = source
+            .index
+            .intervals(&sheet.tracks.iter().map(|t| t.ticks).collect::<Vec<_>>())
+            .map_err(invalid_cue)?;
+        let rows = songs::table
+            .inner_join(cue_tracks::table.inner_join(cue_sources::table))
+            .filter(cue_sources::sheet_path.eq(sheet_path.to_string_lossy().as_ref()))
+            .select((SongRow::as_select(), CueTrack::as_select()))
+            .order(cue_tracks::track_number.asc())
+            .load::<(SongRow, CueTrack)>(conn)?;
+        if rows.len() != expected.len() {
+            return Err(invalid_cue("incomplete CUE song set"));
+        }
+        let mut owner = None;
+        for ((song, track), (cue, frames)) in rows.iter().zip(sheet.tracks.iter().zip(expected)) {
+            let folder_path: String = music_folders::table
+                .find(song.music_folder_id)
+                .select(music_folders::path)
+                .first(conn)?;
+            let selected = &source.index.frames[frames.clone()];
+            let first = selected
+                .first()
+                .ok_or_else(|| invalid_cue("empty interval"))?;
+            let last = selected
+                .last()
+                .ok_or_else(|| invalid_cue("empty interval"))?;
+            let rate = i32::try_from(source.index.sample_rate).map_err(invalid_cue)?;
+            if song.path != source.image_path
+                || image.parent() != Some(std::path::Path::new(&folder_path))
+                || owner.is_some_and(|id| id != song.music_folder_id)
+                || rate <= 0
+                || !(1..=8).contains(&source.index.channels)
+                || !(4..=32).contains(&source.index.bit_depth)
+                || song.sampling_rate != Some(rate)
+                || song.channel_count != Some(i32::from(source.index.channels))
+                || song.bit_depth != Some(i32::from(source.index.bit_depth))
+                || song.track_number != Some(track.track_number)
+                || u32::try_from(track.track_number).map_err(invalid_cue)? != cue.number
+                || usize::try_from(track.start_frame).map_err(invalid_cue)? != frames.start
+                || usize::try_from(track.end_frame).map_err(invalid_cue)? != frames.end
+                || u64::try_from(track.byte_start).map_err(invalid_cue)? != first.offset
+                || u64::try_from(track.byte_end).map_err(invalid_cue)? != last.offset + last.length
+                || last.offset + last.length > source.fingerprint.size
+            {
+                return Err(invalid_cue("inconsistent CUE song metadata or boundaries"));
+            }
+            owner = Some(song.music_folder_id);
+        }
+        let conflicts = diesel::sql_query(
+            "SELECT COUNT(*) AS count FROM (
+            SELECT songs.path FROM songs JOIN cue_tracks ON songs.cue_track_id = cue_tracks.id
+            WHERE songs.path = ?
+            GROUP BY songs.path HAVING COUNT(DISTINCT cue_tracks.cue_source_id) > 1
+        )",
+        )
+        .bind::<diesel::sql_types::Text, _>(&source.image_path)
+        .get_result::<Conflict>(conn)?;
+        if conflicts.count != 0 {
+            return Err(invalid_cue("competing CUE image owners"));
+        }
+        Ok(())
+    }
+
     /// Read only the songs directly owned by one directory.
     pub fn find_by_directory(&self, directory_id: i32) -> Result<Vec<Song>, MusicRepoError> {
         let mut conn = self.pool.get()?;

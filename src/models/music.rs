@@ -3,6 +3,75 @@
 use chrono::NaiveDateTime;
 use serde::Serialize;
 
+/// Scan-local logical identity and whole-frame/byte intervals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CueTrackSource {
+    pub sheet_path: String,
+    pub number: u32,
+    pub frames: std::ops::Range<usize>,
+    pub bytes: std::ops::Range<u64>,
+}
+
+/// Persisted fingerprint and sheet metadata; frame maps remain request-local.
+#[derive(
+    Debug, Clone, PartialEq, Eq, diesel::Queryable, diesel::QueryableByName, diesel::Selectable,
+)]
+#[diesel(table_name = crate::db::schema::cue_sources)]
+pub struct CueSource {
+    pub id: i32,
+    pub sheet_path: String,
+    pub cue_content: String,
+    pub image_size: i64,
+    pub image_modified_seconds: i64,
+    pub image_modified_nanos: i32,
+}
+
+impl CueSource {
+    pub fn fingerprint(&self) -> std::io::Result<crate::flac::Fingerprint> {
+        Ok(crate::flac::Fingerprint {
+            size: u64::try_from(self.image_size).map_err(std::io::Error::other)?,
+            modified_ns: u128::try_from(self.image_modified_seconds)
+                .map_err(std::io::Error::other)?
+                * 1_000_000_000
+                + u128::try_from(self.image_modified_nanos).map_err(std::io::Error::other)?,
+        })
+    }
+}
+
+#[derive(
+    Debug, Clone, PartialEq, Eq, diesel::Queryable, diesel::QueryableByName, diesel::Selectable,
+)]
+#[diesel(table_name = crate::db::schema::cue_tracks)]
+pub struct CueTrack {
+    pub id: i32,
+    pub cue_source_id: i32,
+    pub track_number: i32,
+    pub start_frame: i64,
+    pub end_frame: i64,
+    pub byte_start: i64,
+    pub byte_end: i64,
+}
+
+/// A file path or a stable numbered entry in an external sheet.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SongIdentity {
+    File(String),
+    Cue { sheet_path: String, number: u32 },
+}
+
+impl SongIdentity {
+    #[must_use]
+    pub fn from_source(path: &str, cue: Option<&CueTrackSource>) -> Self {
+        cue.map_or_else(
+            || Self::File(path.to_owned()),
+            |cue| Self::Cue {
+                sheet_path: cue.sheet_path.clone(),
+                number: cue.number,
+            },
+        )
+    }
+}
+
 /// Timestamp format used by Subsonic API responses.
 pub const SUBSONIC_DATETIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.3fZ";
 
@@ -538,6 +607,7 @@ pub struct Song {
     pub album_name: Option<String>,
     pub music_folder_id: i32,
     pub path: String,
+    pub cue_track_id: Option<i32>,
     pub parent_path: String,
     pub file_size: i64,
     pub content_type: String,
@@ -956,6 +1026,7 @@ pub struct NewSong {
     pub album_name: Option<String>,
     pub music_folder_id: i32,
     pub path: String,
+    pub cue_track_id: Option<i32>,
     pub parent_path: String,
     pub file_size: i64,
     pub content_type: String,

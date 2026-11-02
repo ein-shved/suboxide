@@ -12,8 +12,10 @@ use tokio::sync::watch;
 
 use crate::cover_art::{content_hash, extension_from_mime, mime_from_extension};
 use crate::db::{DbPool, MusicFolderRepository, MusicRepoError};
-use crate::models::music::{MusicFolder, normalize_search_text};
+use crate::flac::{CueSource, Fingerprint, FrameIndex};
+use crate::models::music::{CueTrackSource, MusicFolder, SongIdentity, normalize_search_text};
 use crate::paths::resolve_cover_art_dir;
+use crate::scanner::cue::CueSheet;
 use crate::scanner::state::{ScanPhase, ScanStateHandle};
 use crate::scanner::types::{
     AUDIO_EXTENSIONS, BATCH_SIZE, COVER_ART_FILENAMES, DEFAULT_AUTO_SCAN_INTERVAL_SECS,
@@ -43,8 +45,10 @@ struct DiscoveredFile {
     file_modified_at: Option<i64>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ExistingSong {
+    id: i32,
+    path: String,
     file_modified_at: Option<i64>,
     file_size: i64,
     album_id: Option<i32>,
@@ -53,11 +57,53 @@ struct ExistingSong {
 #[derive(Debug, Default)]
 struct DirectoryListing {
     files: Vec<DiscoveredFile>,
+    sheets: Vec<PathBuf>,
     audio_paths: HashSet<String>,
     entries: HashSet<PathBuf>,
     children: Vec<PathBuf>,
     complete: bool,
     failures: usize,
+}
+
+#[derive(Debug, Default)]
+struct CueDiscovery {
+    sources: Vec<(String, CueSource)>,
+    tracks: Vec<ScannedTrack>,
+    images: HashSet<String>,
+    retained: HashSet<SongIdentity>,
+    replaced: HashSet<SongIdentity>,
+    failed: usize,
+    skipped: usize,
+}
+
+#[derive(Debug)]
+struct ParsedCue {
+    sheet_path: String,
+    image: String,
+    content: String,
+    sheet: CueSheet,
+}
+
+#[derive(Debug)]
+struct PendingCue {
+    pair: ParsedCue,
+    update: Option<(CueSource, Vec<ScannedTrack>)>,
+}
+
+impl ParsedCue {
+    fn read(path: &Path) -> std::io::Result<Self> {
+        let content = fs::read_to_string(path)?;
+        let sheet = CueSheet::parse(&content)?;
+        Ok(Self {
+            sheet_path: path.to_string_lossy().into_owned(),
+            image: path
+                .with_file_name(&sheet.image)
+                .to_string_lossy()
+                .into_owned(),
+            content,
+            sheet,
+        })
+    }
 }
 
 enum AutoScanOutcome {
@@ -367,7 +413,7 @@ impl Scanner {
 
     fn remove_owned(&self, folder: &MusicFolder) -> Result<ScanResult, ScanError> {
         let existing = self.get_existing_songs(folder.id)?;
-        let paths: Vec<_> = existing.keys().cloned().collect();
+        let paths: Vec<_> = existing.values().map(|song| song.id).collect();
         let albums = existing.values().filter_map(|song| song.album_id).collect();
         tracing::debug!(name: "scan.directory.reconcile", owner = folder.id, path = %folder.path);
         let removed = self.remove_deleted_songs(&paths)?;
@@ -386,6 +432,7 @@ impl Scanner {
         mode: ScanMode,
         state: Option<&ScanStateHandle>,
     ) -> Result<ScanResult, ScanError> {
+        use diesel::prelude::*;
         let folders = MusicFolderRepository::new(self.pool.clone());
         let relative = relative.to_string_lossy();
         let folder = if listing.audio_paths.is_empty() {
@@ -397,15 +444,23 @@ impl Scanner {
             Some(folder) => self.get_existing_songs(folder.id)?,
             None => HashMap::new(),
         };
+        let mut cues = self.discover_cues(listing, &existing, mode)?;
+        let ordinary: Vec<_> = listing
+            .files
+            .iter()
+            .filter(|file| !cues.images.contains(file.path.to_string_lossy().as_ref()))
+            .collect();
         let (files, skipped) =
-            Self::split_discovered_files_for_mode(&listing.files, &existing, mode);
+            Self::split_discovered_files_for_mode(ordinary.iter().copied(), &existing, mode);
         if let Some(state) = state {
             state.set_phase(ScanPhase::Processing);
-            state.set_total(state.get_total() + listing.audio_paths.len() as u64);
-            state.set_count(state.get_count() + skipped as u64);
+            state.set_total(
+                state.get_total() + (ordinary.len() + cues.tracks.len() + cues.skipped) as u64,
+            );
+            state.set_count(state.get_count() + (skipped + cues.skipped) as u64);
         }
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
-        let tracks: Vec<_> = files.par_iter().filter_map(|file| {
+        let mut tracks: Vec<_> = files.par_iter().filter_map(|file| {
             tracing::dispatcher::with_default(&dispatch, || {
                 match Self::read_track_metadata_static(file) {
                     Ok(track) => Some(track),
@@ -414,61 +469,418 @@ impl Scanner {
             })
         }).collect();
         let metadata_failures = files.len() - tracks.len();
-        let mut result = if let Some(folder) = &folder {
-            self.process_tracks_with_options(folder, tracks, &existing, state, skipped)?
-        } else {
-            ScanResult::default()
-        };
-        result.tracks_found = listing.audio_paths.len();
-        result.tracks_failed += listing.failures + metadata_failures;
-        if let Some(folder) = &folder {
-            tracing::debug!(name: "scan.directory.reconcile", owner = folder.id, path = %folder.path);
-            if listing.complete {
-                let deleted: Vec<_> = existing
-                    .keys()
-                    .filter(|path| !listing.audio_paths.contains(*path))
-                    .cloned()
-                    .collect();
-                let albums = deleted
-                    .iter()
-                    .filter_map(|path| existing.get(path).and_then(|song| song.album_id))
-                    .collect();
-                result.tracks_removed += self.remove_deleted_songs(&deleted)?;
-                self.update_album_stats_for_ids(&albums)?;
+        let processed: HashSet<_> = tracks.iter().map(|track| track.path.as_path()).collect();
+        for (identity, song) in &existing {
+            if matches!(identity, SongIdentity::Cue { .. })
+                && !cues.replaced.contains(identity)
+                && listing.audio_paths.contains(&song.path)
+                && !processed.contains(Path::new(&song.path))
+            {
+                cues.retained.insert(identity.clone());
             }
         }
-        Ok(result)
+        tracks.extend(cues.tracks);
+        let found = ordinary.len()
+            + tracks
+                .iter()
+                .filter(|track| track.cue_track.is_some())
+                .count()
+            + cues.skipped;
+        let Some(folder) = folder else {
+            return Ok(ScanResult {
+                tracks_failed: listing.failures + cues.failed + metadata_failures,
+                ..ScanResult::default()
+            });
+        };
+        let mut conn = self.pool.get().map_err(MusicRepoError::from)?;
+        conn.transaction::<_, ScanError, _>(|conn| {
+            for (sheet, source) in &cues.sources { crate::db::SongRepository::put_cue_source(conn, sheet, source)?; }
+            let mut result = self.process_tracks_with_options(conn, &folder, tracks, &existing, state, skipped + cues.skipped)?;
+            result.tracks_found = found;
+            result.tracks_failed += listing.failures + metadata_failures + cues.failed;
+            tracing::debug!(name: "scan.directory.reconcile", owner = folder.id, path = %folder.path);
+            let absent: Vec<_> = existing.iter().filter(|(identity, _)| !cues.retained.contains(*identity) && (listing.complete || cues.replaced.contains(*identity))).map(|(_, song)| song).collect();
+            let ids: Vec<_> = absent.iter().map(|song| song.id).collect();
+            let albums = absent.iter().filter_map(|song| song.album_id).collect();
+            result.tracks_removed += diesel::delete(crate::db::schema::songs::table.filter(crate::db::schema::songs::id.eq_any(ids))).execute(conn).map_err(MusicRepoError::from)?;
+            crate::db::repo::music::cleanup_cue_sources(conn).map_err(MusicRepoError::from)?;
+            for (sheet, source) in &cues.sources {
+                Self::update_cue_sizes(conn, sheet, source)?;
+                crate::db::SongRepository::validate_cue_publication(conn, sheet, source)?;
+            }
+            crate::db::repo::music::reconcile_albums(conn, &albums).map_err(MusicRepoError::from)?;
+            Ok(result)
+        })
+    }
+
+    fn discover_cues(
+        &self,
+        listing: &DirectoryListing,
+        existing: &HashMap<SongIdentity, ExistingSong>,
+        mode: ScanMode,
+    ) -> Result<CueDiscovery, ScanError> {
+        let mut discovered = CueDiscovery::default();
+        for (identity, song) in existing {
+            let sheet_present = match identity {
+                SongIdentity::File(_) => true,
+                SongIdentity::Cue { sheet_path, .. } => {
+                    listing.entries.contains(Path::new(sheet_path))
+                }
+            };
+            if sheet_present && listing.audio_paths.contains(&song.path) {
+                discovered.retained.insert(identity.clone());
+            }
+        }
+        let mut sheets = Vec::new();
+        let mut indexed_sheets = HashSet::new();
+        let mut claims = HashMap::<String, usize>::new();
+        for path in &listing.sheets {
+            match ParsedCue::read(path) {
+                Ok(pair) => {
+                    *claims.entry(pair.image.clone()).or_default() += 1;
+                    discovered.images.insert(pair.image.clone());
+                    sheets.push(pair);
+                }
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "CUE parsing failed");
+                    discovered.failed += 1;
+                    // An unreadable sheet cannot safely identify its new image.
+                    discovered.images.extend(
+                        listing
+                            .audio_paths
+                            .iter()
+                            .filter(|path| {
+                                Path::new(path)
+                                    .extension()
+                                    .is_some_and(|ext| ext.eq_ignore_ascii_case("flac"))
+                            })
+                            .cloned(),
+                    );
+                }
+            }
+        }
+        let repo = crate::db::SongRepository::new(self.pool.clone());
+        let mut pending = Vec::new();
+        for pair in sheets {
+            if claims.get(&pair.image) != Some(&1) {
+                discovered.failed += 1;
+                tracing::warn!(sheet_path = %pair.sheet_path, "multiple CUE sheets claim one image");
+                continue;
+            }
+            let previous = repo.cue_source(&pair.sheet_path)?;
+            match Self::prepare_cue_pair(&pair, listing, previous.as_ref(), existing, mode) {
+                Ok(update) => pending.push(PendingCue { pair, update }),
+                Err(error) => {
+                    discovered.failed += 1;
+                    tracing::warn!(sheet_path = %pair.sheet_path, %error, "CUE indexing failed");
+                }
+            }
+        }
+        let pending = Self::resolve_cue_owners(pending, listing, existing, &mut discovered.failed);
+        for PendingCue { pair, update } in pending {
+            let ParsedCue {
+                sheet_path,
+                image,
+                sheet,
+                ..
+            } = &pair;
+            match update {
+                Some((source, tracks)) => {
+                    discovered.sources.push((sheet_path.clone(), source));
+                    discovered.tracks.extend(tracks);
+                }
+                None => {
+                    discovered.skipped += sheet.tracks.len();
+                }
+            }
+            indexed_sheets.insert(sheet_path.clone());
+            for identity in existing.keys().filter(|identity| match identity {
+                SongIdentity::File(path) => path == image,
+                SongIdentity::Cue {
+                    sheet_path: old, ..
+                } => old == sheet_path,
+            }) {
+                discovered.retained.remove(identity);
+                discovered.replaced.insert(identity.clone());
+            }
+            discovered
+                .retained
+                .extend(sheet.tracks.iter().map(|track| SongIdentity::Cue {
+                    sheet_path: sheet_path.clone(),
+                    number: track.number,
+                }));
+        }
+        for (identity, song) in existing {
+            if let SongIdentity::Cue { sheet_path, .. } = identity
+                && !indexed_sheets.contains(sheet_path)
+                && (!listing.complete || listing.entries.contains(Path::new(sheet_path)))
+            {
+                discovered.images.insert(song.path.clone());
+            }
+        }
+        Ok(discovered)
+    }
+
+    fn resolve_cue_owners(
+        mut pending: Vec<PendingCue>,
+        listing: &DirectoryListing,
+        existing: &HashMap<SongIdentity, ExistingSong>,
+        failures: &mut usize,
+    ) -> Vec<PendingCue> {
+        loop {
+            let destinations: HashMap<_, _> = pending
+                .iter()
+                .map(|entry| (entry.pair.sheet_path.as_str(), entry.pair.image.as_str()))
+                .collect();
+            let blocked: HashSet<_> = pending.iter().enumerate().filter(|(_, entry)| existing.iter().any(|(identity, song)| {
+                matches!(identity, SongIdentity::Cue { sheet_path: old, .. }
+                    if old != &entry.pair.sheet_path && song.path == entry.pair.image
+                    && (!listing.complete || listing.entries.contains(Path::new(old)))
+                    && destinations.get(old.as_str()).is_none_or(|image| *image == entry.pair.image))
+            })).map(|(i, _)| i).collect();
+            if blocked.is_empty() {
+                return pending;
+            }
+            *failures += blocked.len();
+            // A failed replacement keeps ownership of its old image. Repeat
+            // until all dependents of failed replacements are also deferred.
+            pending = pending.into_iter().enumerate().filter_map(|(i, entry)| {
+                if blocked.contains(&i) { tracing::warn!(sheet_path = %entry.pair.sheet_path, "CUE image has an unresolved sheet owner"); None } else { Some(entry) }
+            }).collect();
+        }
+    }
+
+    fn prepare_cue_pair(
+        pair: &ParsedCue,
+        listing: &DirectoryListing,
+        previous: Option<&crate::models::music::CueSource>,
+        existing: &HashMap<SongIdentity, ExistingSong>,
+        mode: ScanMode,
+    ) -> Result<Option<(CueSource, Vec<ScannedTrack>)>, ScanError> {
+        let ParsedCue {
+            sheet_path,
+            image,
+            content,
+            sheet,
+        } = pair;
+        let path = Path::new(image);
+        let fingerprint = Fingerprint::from_metadata(&fs::metadata(path)?)?;
+        let numbers: HashSet<_> = sheet.tracks.iter().map(|track| track.number).collect();
+        let stored: HashSet<_> = existing
+            .keys()
+            .filter_map(|key| match key {
+                SongIdentity::Cue {
+                    sheet_path: old,
+                    number,
+                } if old == sheet_path => Some(*number),
+                _ => None,
+            })
+            .collect();
+        if mode == ScanMode::Incremental
+            && previous.is_some_and(|old| {
+                existing.iter().any(|(identity, song)| {
+                    matches!(identity,
+                    SongIdentity::Cue { sheet_path: old_sheet, .. } if old_sheet == sheet_path)
+                        && song.path == *image
+                }) && old.cue_content == *content
+                    && old.fingerprint().is_ok_and(|old| old == fingerprint)
+            })
+            && stored == numbers
+        {
+            return Ok(None);
+        }
+        let file = listing
+            .files
+            .iter()
+            .find(|file| file.path == path)
+            .ok_or_else(|| std::io::Error::other("CUE image not successfully discovered"))?;
+        let (index, indexed_fingerprint) = FrameIndex::read(path)?;
+        let intervals = index.intervals(
+            &sheet
+                .tracks
+                .iter()
+                .map(|track| track.ticks)
+                .collect::<Vec<_>>(),
+        )?;
+        let image_metadata = Self::read_track_metadata_static(file)?;
+        if indexed_fingerprint != fingerprint
+            || Fingerprint::from_metadata(&fs::metadata(path)?)? != fingerprint
+        {
+            return Err(std::io::Error::other("CUE source changed during scan").into());
+        }
+        let tracks = sheet
+            .tracks
+            .iter()
+            .zip(intervals)
+            .map(|(cue, frames)| {
+                let mut track = Self::cue_metadata(&image_metadata, sheet, cue);
+                track.track_number = Some(cue.number);
+                track.sample_rate = Some(index.sample_rate);
+                track.channels = Some(index.channels);
+                track.bit_depth = Some(index.bit_depth);
+                let samples: u64 = index.frames[frames.clone()]
+                    .iter()
+                    .map(|frame| u64::from(frame.samples))
+                    .sum();
+                track.duration_secs =
+                    u32::try_from(samples / u64::from(index.sample_rate)).unwrap_or(u32::MAX);
+                track.cue_track = Some(CueTrackSource {
+                    sheet_path: sheet_path.to_owned(),
+                    number: cue.number,
+                    bytes: index.frames[frames.start].offset
+                        ..index.frames[frames.end - 1].offset + index.frames[frames.end - 1].length,
+                    frames,
+                });
+                track
+            })
+            .collect();
+        Ok(Some((
+            CueSource {
+                image_path: image.to_owned(),
+                cue_content: content.to_owned(),
+                fingerprint,
+                index,
+            },
+            tracks,
+        )))
+    }
+
+    fn cue_metadata(
+        image: &ScannedTrack,
+        sheet: &CueSheet,
+        cue: &crate::scanner::cue::CueTrack,
+    ) -> ScannedTrack {
+        let mut track = image.clone();
+        track
+            .title
+            .clone_from(cue.title.as_ref().unwrap_or(&image.title));
+        track.artist = cue
+            .performer
+            .as_ref()
+            .or(sheet.performer.as_ref())
+            .or(image.artist.as_ref())
+            .cloned();
+        track.album = sheet.title.as_ref().or(image.album.as_ref()).cloned();
+        track.album_artist = sheet
+            .performer
+            .as_ref()
+            .or(image.album_artist.as_ref())
+            .cloned();
+        track
+    }
+
+    fn update_cue_sizes(
+        conn: &mut diesel::SqliteConnection,
+        sheet: &str,
+        source: &CueSource,
+    ) -> Result<(), ScanError> {
+        use crate::db::repo::music::SongRow;
+        use crate::db::schema::{albums, cue_sources, cue_tracks, songs};
+        use diesel::prelude::*;
+        let file = fs::File::open(&source.image_path)?;
+        let rows = songs::table
+            .inner_join(cue_tracks::table.inner_join(cue_sources::table))
+            .filter(cue_sources::sheet_path.eq(sheet))
+            .select((
+                SongRow::as_select(),
+                crate::models::music::CueTrack::as_select(),
+            ))
+            .load::<(SongRow, crate::models::music::CueTrack)>(conn)
+            .map_err(MusicRepoError::from)?;
+        for (row, track) in rows {
+            let song = crate::models::music::Song::from(row);
+            let index = FrameIndex {
+                frames: source
+                    .index
+                    .frames
+                    .get(
+                        usize::try_from(track.start_frame).map_err(std::io::Error::other)?
+                            ..usize::try_from(track.end_frame).map_err(std::io::Error::other)?,
+                    )
+                    .ok_or_else(|| std::io::Error::other("invalid staged CUE interval"))?
+                    .to_vec(),
+                streaminfo: source.index.streaminfo.clone(),
+                sample_rate: source.index.sample_rate,
+                channels: source.index.channels,
+                bit_depth: source.index.bit_depth,
+                total_samples: source.index.total_samples,
+            };
+            let album_artist = song
+                .album_id
+                .map(|id| {
+                    albums::table
+                        .find(id)
+                        .select(albums::artist_name)
+                        .first::<Option<String>>(conn)
+                })
+                .transpose()
+                .map_err(MusicRepoError::from)?
+                .flatten();
+            let size = crate::flac::VirtualTrack::new(
+                file.try_clone()?,
+                &index,
+                &song,
+                album_artist.as_deref(),
+            )?
+            .length();
+            diesel::update(songs::table.find(song.id))
+                .set(songs::file_size.eq(i64::try_from(size).map_err(std::io::Error::other)?))
+                .execute(conn)
+                .map_err(MusicRepoError::from)?;
+        }
+        if Fingerprint::from_metadata(&file.metadata()?)? != source.fingerprint {
+            return Err(std::io::Error::other("CUE source changed during publication").into());
+        }
+        Ok(())
     }
 
     /// Get existing songs in a folder from the database.
     fn get_existing_songs(
         &self,
         folder_id: i32,
-    ) -> Result<HashMap<String, ExistingSong>, ScanError> {
-        use crate::db::schema::songs;
+    ) -> Result<HashMap<SongIdentity, ExistingSong>, ScanError> {
+        use crate::db::schema::{cue_sources, cue_tracks, songs};
         use diesel::prelude::*;
 
         let mut conn = self.pool.get().map_err(MusicRepoError::from)?;
         let existing = songs::table
+            .left_join(cue_tracks::table.left_join(cue_sources::table))
             .filter(songs::music_folder_id.eq(folder_id))
             .select((
+                songs::id,
                 songs::path,
+                cue_sources::sheet_path.nullable(),
+                cue_tracks::track_number.nullable(),
                 songs::file_modified_at,
                 songs::file_size,
                 songs::album_id,
                 songs::music_folder_id,
             ))
-            .load::<(String, Option<i64>, i64, Option<i32>, i32)>(&mut conn)
+            .load::<(
+                i32,
+                String,
+                Option<String>,
+                Option<i32>,
+                Option<i64>,
+                i64,
+                Option<i32>,
+                i32,
+            )>(&mut conn)
             .map_err(MusicRepoError::from)?;
 
         tracing::debug!(name: "scan.directory.read", owner = folder_id, count = existing.len());
         Ok(existing
             .into_iter()
-            .map(|(path, file_modified_at, file_size, album_id, owner)| {
+            .map(|(id, path, sheet_path, number, file_modified_at, file_size, album_id, owner)| {
                 tracing::debug!(name: "scan.directory.member", owner = folder_id, returned_owner = owner);
                 (
-                    path,
+                    match (sheet_path, number) {
+                        (Some(sheet_path), Some(number)) => SongIdentity::Cue { sheet_path, number: u32::try_from(number).expect("positive CUE track number") },
+                        _ => SongIdentity::File(path.clone()),
+                    },
                     ExistingSong {
+                        id,
+                        path,
                         file_modified_at,
                         file_size,
                         album_id,
@@ -479,17 +891,19 @@ impl Scanner {
     }
 
     /// Remove songs that no longer exist on disk.
-    fn remove_deleted_songs(&self, paths: &[String]) -> Result<usize, ScanError> {
+    fn remove_deleted_songs(&self, ids: &[i32]) -> Result<usize, ScanError> {
         use crate::db::schema::songs;
         use diesel::prelude::*;
 
         let mut conn = self.pool.get().map_err(MusicRepoError::from)?;
 
-        let deleted = diesel::delete(songs::table.filter(songs::path.eq_any(paths)))
-            .execute(&mut conn)
-            .map_err(MusicRepoError::from)?;
-
-        Ok(deleted)
+        conn.transaction::<_, ScanError, _>(|conn| {
+            let deleted = diesel::delete(songs::table.filter(songs::id.eq_any(ids)))
+                .execute(conn)
+                .map_err(MusicRepoError::from)?;
+            crate::db::repo::music::cleanup_cue_sources(conn).map_err(MusicRepoError::from)?;
+            Ok(deleted)
+        })
     }
 
     /// Clean up orphaned artists and albums (those with no songs).
@@ -551,6 +965,14 @@ impl Scanner {
             listing.children.push(path.to_path_buf());
             return Ok(());
         }
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("cue"))
+            && (metadata.is_file() || metadata.is_symlink())
+        {
+            listing.sheets.push(path.to_path_buf());
+            return Ok(());
+        }
         if !path
             .extension()
             .and_then(|ext| ext.to_str())
@@ -600,21 +1022,22 @@ impl Scanner {
     }
 
     fn split_discovered_files_for_mode<'a>(
-        discovered_files: &'a [DiscoveredFile],
-        existing_songs: &HashMap<String, ExistingSong>,
+        discovered_files: impl IntoIterator<Item = &'a DiscoveredFile>,
+        existing_songs: &HashMap<SongIdentity, ExistingSong>,
         mode: ScanMode,
     ) -> (Vec<&'a DiscoveredFile>, usize) {
+        let discovered_files = discovered_files.into_iter();
         if mode == ScanMode::Full {
-            return (discovered_files.iter().collect(), 0);
+            return (discovered_files.collect(), 0);
         }
 
-        let mut to_process = Vec::with_capacity(discovered_files.len());
+        let mut to_process = Vec::with_capacity(discovered_files.size_hint().0);
         let mut skipped_unchanged = 0;
 
         for file in discovered_files {
             let path_str = file.path.to_string_lossy();
             let unchanged = existing_songs
-                .get(path_str.as_ref())
+                .get(&SongIdentity::File(path_str.into_owned()))
                 .is_some_and(|stored| {
                     matches!((stored.file_modified_at, file.file_modified_at), (Some(stored), Some(current)) if stored == current)
                         && stored.file_size == i64::try_from(file.file_size).unwrap_or(i64::MAX)
@@ -701,6 +1124,7 @@ impl Scanner {
 
         Ok(ScannedTrack {
             path: path.clone(),
+            cue_track: None,
             parent_path,
             file_size: file.file_size,
             content_type,
@@ -747,9 +1171,10 @@ impl Scanner {
     )]
     fn process_tracks_with_options(
         &self,
+        conn: &mut diesel::SqliteConnection,
         folder: &MusicFolder,
         tracks: Vec<ScannedTrack>,
-        existing_songs: &HashMap<String, ExistingSong>,
+        existing_songs: &HashMap<SongIdentity, ExistingSong>,
         state: Option<&ScanStateHandle>,
         initial_tracks_skipped: usize,
     ) -> Result<ScanResult, ScanError> {
@@ -766,12 +1191,10 @@ impl Scanner {
         // Ensure cover art directory exists
         self.ensure_cover_art_dir()?;
 
-        let mut conn = self.pool.get().map_err(MusicRepoError::from)?;
-
         // Pre-load all existing artists into cache (much faster than individual lookups)
         let mut artist_cache: HashMap<String, i32> = artists::table
             .select((artists::name, artists::id))
-            .load::<(String, i32)>(&mut conn)
+            .load::<(String, i32)>(conn)
             .map_err(MusicRepoError::from)?
             .into_iter()
             .collect();
@@ -779,7 +1202,7 @@ impl Scanner {
         // Pre-load all existing albums into cache
         let mut album_cache: HashMap<(String, Option<i32>), i32> = albums::table
             .select((albums::name, albums::artist_id, albums::id))
-            .load::<(String, Option<i32>, i32)>(&mut conn)
+            .load::<(String, Option<i32>, i32)>(conn)
             .map_err(MusicRepoError::from)?
             .into_iter()
             .map(|(name, artist_id, id)| ((name, artist_id), id))
@@ -788,7 +1211,7 @@ impl Scanner {
         // Pre-load album cover art hashes
         let mut album_cover_art_cache: HashMap<i32, Option<String>> = albums::table
             .select((albums::id, albums::cover_art))
-            .load::<(i32, Option<String>)>(&mut conn)
+            .load::<(i32, Option<String>)>(conn)
             .map_err(MusicRepoError::from)?
             .into_iter()
             .collect();
@@ -841,7 +1264,7 @@ impl Scanner {
             let new_artist_ids: Vec<(String, i32)> = artists::table
                 .filter(artists::name.eq_any(&new_artists))
                 .select((artists::name, artists::id))
-                .load(&mut conn)
+                .load(conn)
                 .map_err(MusicRepoError::from)?;
 
             for (name, id) in new_artist_ids {
@@ -888,7 +1311,7 @@ impl Scanner {
                             albums::search_name.eq(normalize_search_text(album_name)),
                         ))
                         .on_conflict_do_nothing()
-                        .execute(&mut conn)
+                        .execute(conn)
                         .map_err(MusicRepoError::from)?;
 
                     // Get the album ID
@@ -903,7 +1326,7 @@ impl Scanner {
 
                     let album_row: Option<(i32, Option<String>)> = query
                         .select((albums::id, albums::cover_art))
-                        .first(&mut conn)
+                        .first(conn)
                         .optional()
                         .map_err(MusicRepoError::from)?;
 
@@ -946,7 +1369,7 @@ impl Scanner {
                                 if let Err(e) =
                                     diesel::update(albums::table.filter(albums::id.eq(album_id)))
                                         .set(albums::cover_art.eq(&cover_art_hash))
-                                        .execute(&mut conn)
+                                        .execute(conn)
                                 {
                                     tracing::event!(
                                         name: "scan.cover_art.album_update_failed",
@@ -983,7 +1406,8 @@ impl Scanner {
                 None
             };
 
-            let is_update = existing_songs.contains_key(&path_str);
+            let identity = SongIdentity::from_source(&path_str, track.cue_track.as_ref());
+            let song_id = existing_songs.get(&identity).map(|song| song.id);
 
             prepared_tracks.push(PreparedTrack {
                 track,
@@ -991,7 +1415,8 @@ impl Scanner {
                 artist_id,
                 album_id,
                 cover_art: album_cover_art_id,
-                is_update,
+                identity,
+                song_id,
             });
         }
 
@@ -999,11 +1424,19 @@ impl Scanner {
         for batch in prepared_tracks.chunks(BATCH_SIZE) {
             conn.transaction::<_, MusicRepoError, _>(|conn| {
                 for prepared in batch {
+                    let cue_track_id = prepared
+                        .track
+                        .cue_track
+                        .as_ref()
+                        .map(|cue| crate::db::SongRepository::put_cue_track(conn, cue))
+                        .transpose()?;
                     let search_name = normalize_search_text(&prepared.track.title);
                     let query_result =
-                        if prepared.is_update {
-                            diesel::update(songs::table.filter(songs::path.eq(&prepared.path_str)))
+                        if let Some(id) = prepared.song_id {
+                            diesel::update(songs::table.filter(songs::id.eq(id)))
                                 .set((
+                                    songs::path.eq(&prepared.path_str),
+                                    songs::cue_track_id.eq(cue_track_id),
                                     songs::title.eq(&prepared.track.title),
                                     songs::search_name.eq(&search_name),
                                     songs::album_id.eq(prepared.album_id),
@@ -1054,6 +1487,7 @@ impl Scanner {
                                     songs::album_name.eq(&prepared.track.album),
                                     songs::music_folder_id.eq(folder.id),
                                     songs::path.eq(&prepared.path_str),
+                                    songs::cue_track_id.eq(cue_track_id),
                                     songs::parent_path
                                         .eq(prepared.track.parent_path.to_string_lossy()),
                                     songs::file_size
@@ -1105,13 +1539,13 @@ impl Scanner {
 
             // Update counters and progress
             for prepared in batch {
-                if prepared.is_update {
+                if prepared.song_id.is_some() {
                     result.tracks_updated += 1;
                 } else {
                     result.tracks_added += 1;
                 }
                 if let Some(album_id) = existing_songs
-                    .get(&prepared.path_str)
+                    .get(&prepared.identity)
                     .and_then(|song| song.album_id)
                 {
                     dirty_album_ids.insert(album_id);
@@ -1126,7 +1560,7 @@ impl Scanner {
         }
 
         // Update album song counts and durations for dirty albums only
-        crate::db::repo::music::reconcile_albums(&mut conn, &dirty_album_ids)
+        crate::db::repo::music::reconcile_albums(conn, &dirty_album_ids)
             .map_err(MusicRepoError::from)?;
 
         Ok(result)
@@ -1315,7 +1749,7 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
 
-    use super::{DiscoveredFile, ExistingSong, ScanMode, Scanner};
+    use super::{DiscoveredFile, ExistingSong, ScanMode, Scanner, SongIdentity};
 
     fn discovered(path: &str, file_modified_at: Option<i64>) -> DiscoveredFile {
         DiscoveredFile {
@@ -1335,16 +1769,20 @@ mod tests {
 
         let existing = HashMap::from([
             (
-                "/music/unchanged.mp3".to_string(),
+                SongIdentity::File("/music/unchanged.mp3".to_string()),
                 ExistingSong {
+                    id: 1,
+                    path: "/music/unchanged.mp3".to_string(),
                     file_modified_at: Some(100),
                     file_size: 123,
                     album_id: None,
                 },
             ),
             (
-                "/music/changed.mp3".to_string(),
+                SongIdentity::File("/music/changed.mp3".to_string()),
                 ExistingSong {
+                    id: 1,
+                    path: "/music/changed.mp3".to_string(),
                     file_modified_at: Some(150),
                     file_size: 123,
                     album_id: None,
@@ -1380,8 +1818,10 @@ mod tests {
         ];
 
         let existing = HashMap::from([(
-            "/music/one.mp3".to_string(),
+            SongIdentity::File("/music/one.mp3".to_string()),
             ExistingSong {
+                id: 1,
+                path: "/music/one.mp3".to_string(),
                 file_modified_at: Some(10),
                 file_size: 123,
                 album_id: None,

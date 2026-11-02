@@ -5,12 +5,9 @@ use axum::{
     response::IntoResponse,
 };
 use image::{GenericImageView, ImageFormat, imageops::FilterType};
-use std::{
-    io::Cursor,
-    path::{Path, PathBuf},
-};
+use std::{io::Cursor, path::Path};
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::AsyncReadExt;
 use tokio_util::io::ReaderStream;
 
 use crate::api::auth::SubsonicContext;
@@ -18,38 +15,133 @@ use crate::api::handlers::util;
 use crate::models::music::Song;
 use crate::paths::{resolve_avatars_dir, resolve_cover_art_dir};
 
-/// Validate that a song's path is within one of the configured music folders.
-/// This prevents path traversal attacks where a malicious path in the database
-/// could be used to read arbitrary files.
-fn validate_song_path(song: &Song, auth: &SubsonicContext) -> Result<PathBuf, &'static str> {
-    let song_path = Path::new(&song.path);
+#[derive(Debug)]
+enum AudioReader {
+    File(std::fs::File),
+    Cue(crate::flac::VirtualTrack),
+}
 
-    // Canonicalize the song path to resolve any symlinks and ../ components
-    let Ok(canonical_path) = song_path.canonicalize() else {
-        return Err("Audio file not found on disk");
-    };
-
-    // Get all music folders and verify the song is within one of them
-    let music_folders = auth
-        .music()
-        .get_music_folders()
-        .map_err(|_e| "Music folder lookup failed")?;
-    for folder in &music_folders {
-        if let Ok(folder_canonical) = Path::new(&folder.path).canonicalize()
-            && canonical_path.starts_with(&folder_canonical)
-        {
-            return Ok(canonical_path);
+impl std::io::Read for AudioReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::File(file) => file.read(buffer),
+            Self::Cue(track) => track.read(buffer),
         }
     }
+}
 
-    // Song path is not within any music folder - potential path traversal
-    tracing::warn!(
-        name = "media.path_validation.blocked",
-        song.id = song.id,
-        song.path = %song.path,
-        "song path validation failed"
-    );
-    Err("Audio file not found in music library")
+impl AudioReader {
+    fn into_body(self, start: u64, length: u64) -> std::io::Result<Body> {
+        use std::io::{Read, Seek, SeekFrom};
+        match self {
+            Self::File(mut file) => {
+                file.seek(SeekFrom::Start(start))?;
+                Ok(Body::from_stream(ReaderStream::new(
+                    File::from_std(file).take(length),
+                )))
+            }
+            Self::Cue(mut track) => {
+                track.seek(SeekFrom::Start(start))?;
+                let (writer, reader) = tokio::io::duplex(64 * 1024);
+                tokio::task::spawn_blocking(move || {
+                    if let Err(error) = std::io::copy(
+                        &mut track.take(length),
+                        &mut tokio_util::io::SyncIoBridge::new(writer),
+                    ) {
+                        tracing::debug!(%error, "virtual FLAC delivery ended");
+                    }
+                });
+                Ok(Body::from_stream(ReaderStream::new(reader)))
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ResolvedAudio {
+    reader: AudioReader,
+    size: u64,
+    filename: String,
+    content_type: String,
+}
+
+async fn resolve_audio(song_id: i32, auth: &SubsonicContext) -> std::io::Result<ResolvedAudio> {
+    let auth = auth.clone();
+    tokio::task::spawn_blocking(move || resolve_audio_blocking(song_id, &auth))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+/// Authorize and open the original source once for every media delivery path.
+fn resolve_audio_blocking(song_id: i32, auth: &SubsonicContext) -> std::io::Result<ResolvedAudio> {
+    use std::io::{Error, ErrorKind};
+    let snapshot = auth
+        .music()
+        .audio_source(song_id)
+        .map_err(Error::other)?
+        .ok_or_else(|| Error::new(ErrorKind::NotFound, "song missing"))?;
+    let song = &snapshot.song;
+    let path = Path::new(&song.path).canonicalize()?;
+    let roots = auth.music().media_roots().map_err(Error::other)?;
+    if !roots.iter().any(|root| {
+        Path::new(&root.path)
+            .canonicalize()
+            .is_ok_and(|root| path.starts_with(root))
+    }) {
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            "audio source outside configured roots",
+        ));
+    }
+    let mut file = std::fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    let (reader, size) = if let Some((cue, source)) = &snapshot.cue {
+        let fingerprint = source.fingerprint()?;
+        if crate::flac::Fingerprint::from_metadata(&metadata)? != fingerprint {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "CUE source changed; rescan required",
+            ));
+        }
+        let album_artist = song
+            .album_id
+            .map(|id| auth.music().get_album(id))
+            .transpose()
+            .map_err(Error::other)?
+            .flatten()
+            .and_then(|album| album.artist_name);
+        let index = crate::flac::FrameIndex::read_interval(&mut file, cue, song)?;
+        if crate::flac::Fingerprint::from_metadata(&file.metadata()?)? != fingerprint {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "CUE source changed while reading",
+            ));
+        }
+        let track = crate::flac::VirtualTrack::new(file, &index, song, album_artist.as_deref())?;
+        let size = track.length();
+        (AudioReader::Cue(track), size)
+    } else {
+        (AudioReader::File(file), metadata.len())
+    };
+    Ok(ResolvedAudio {
+        reader,
+        size,
+        filename: song_filename(song),
+        content_type: song.content_type.clone(),
+    })
+}
+
+fn song_filename(song: &Song) -> String {
+    song.cue_track_id.map_or_else(
+        || sanitized_filename(Path::new(&song.path)),
+        |_| {
+            sanitized_filename(Path::new(&format!(
+                "{:02} - {}.flac",
+                song.track_number.unwrap_or(0),
+                sanitize_zip_component(&song.title)
+            )))
+        },
+    )
 }
 
 fn is_safe_cover_art_id(id: &str) -> bool {
@@ -220,17 +312,18 @@ pub async fn stream(
         return util::unauthorized(&auth);
     }
 
-    // Validate the song path is within a music folder (prevents path traversal)
-    let Ok(path) = validate_song_path(&song, &auth) else {
-        return util::not_found(&auth, "Audio file not found");
+    let ResolvedAudio {
+        reader,
+        size: file_size,
+        content_type,
+        ..
+    } = match resolve_audio(song.id, &auth).await {
+        Ok(audio) => audio,
+        Err(error) => {
+            tracing::warn!(song_id, %error, "audio source resolution failed");
+            return util::not_found(&auth, "Audio file not found");
+        }
     };
-
-    let (file, file_size) =
-        match open_file_with_size(&auth, &path, "Failed to open audio file").await {
-            Ok(file) => file,
-            Err(response) => return response,
-        };
-    let content_type = song.content_type.clone();
 
     // Check for Range header to support seeking
     if let Some(range) = headers.get(header::RANGE).and_then(|v| v.to_str().ok())
@@ -239,14 +332,13 @@ pub async fn stream(
         if let Some(byte_range) = parse_byte_range(range, file_size) {
             let content_length = byte_range.len();
 
-            let mut file = file;
-            if let Err(e) = file.seek(std::io::SeekFrom::Start(byte_range.start)).await {
-                tracing::error!(error = %e, "Failed to seek in file");
-                return util::service_error(&auth, "Failed to seek in file");
-            }
-
-            let stream = ReaderStream::new(file.take(content_length));
-            let body = Body::from_stream(stream);
+            let body = match reader.into_body(byte_range.start, content_length) {
+                Ok(body) => body,
+                Err(error) => {
+                    tracing::error!(%error, "audio seek failed");
+                    return util::service_error(&auth, "Failed to seek in file");
+                }
+            };
 
             return (
                 StatusCode::PARTIAL_CONTENT,
@@ -284,8 +376,13 @@ pub async fn stream(
     }
 
     // No range requested, stream entire file
-    let stream = ReaderStream::new(file);
-    let body = Body::from_stream(stream);
+    let body = match reader.into_body(0, file_size) {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::error!(%error, "audio read failed");
+            return util::service_error(&auth, "Failed to read audio");
+        }
+    };
 
     (
         StatusCode::OK,
@@ -334,7 +431,7 @@ pub async fn download(
                     Ok(songs) => songs,
                     Err(e) => return util::repo_error(&auth, e),
                 };
-                zip_download(&auth, &album.name, album_zip_entries(songs), None)
+                zip_download(&auth, &album.name, album_zip_entries(songs), None).await
             }
             Ok(None) => util::not_found(&auth, "Album not found"),
             Err(e) => util::repo_error(&auth, e),
@@ -345,7 +442,7 @@ pub async fn download(
                     Ok(songs) => songs,
                     Err(e) => return util::repo_error(&auth, e),
                 };
-                zip_download(&auth, &artist.name, artist_zip_entries(songs), None)
+                zip_download(&auth, &artist.name, artist_zip_entries(songs), None).await
             }
             Ok(None) => util::not_found(&auth, "Artist not found"),
             Err(e) => util::repo_error(&auth, e),
@@ -357,7 +454,7 @@ pub async fn download(
                     Err(e) => return util::repo_error(&auth, e),
                 };
                 let (entries, m3u) = playlist_zip_entries(songs, &playlist.name);
-                zip_download(&auth, &playlist.name, entries, Some(m3u))
+                zip_download(&auth, &playlist.name, entries, Some(m3u)).await
             }
             Ok(None) => util::not_found(&auth, "Playlist not found"),
             Err(e) => util::repo_error(&auth, e),
@@ -449,24 +546,25 @@ fn playlist_zip_entries(
 
 /// Serve a single song file as a download attachment.
 async fn download_song(auth: &SubsonicContext, song: &Song) -> axum::response::Response {
-    // Validate the song path is within a music folder (prevents path traversal)
-    let Ok(path) = validate_song_path(song, auth) else {
-        return util::not_found(auth, "Audio file not found");
+    let ResolvedAudio {
+        reader,
+        size: file_size,
+        filename,
+        content_type,
+    } = match resolve_audio(song.id, auth).await {
+        Ok(audio) => audio,
+        Err(error) => {
+            tracing::warn!(song_id = song.id, %error, "audio source resolution failed");
+            return util::not_found(auth, "Audio file not found");
+        }
     };
-
-    // Get filename for Content-Disposition and sanitize it to prevent header injection
-    let filename = sanitized_filename(&path);
-
-    let (file, file_size) =
-        match open_file_with_size(auth, &path, "Failed to open audio file").await {
-            Ok(file) => file,
-            Err(response) => return response,
-        };
-    let content_type = song.content_type.clone();
-
-    // Stream the file
-    let stream = ReaderStream::new(file);
-    let body = Body::from_stream(stream);
+    let body = match reader.into_body(0, file_size) {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::error!(%error, "audio read failed");
+            return util::service_error(auth, "Failed to read audio");
+        }
+    };
 
     (
         StatusCode::OK,
@@ -496,7 +594,7 @@ fn sanitize_zip_component(name: &str) -> String {
 /// Zip entry path for a song in an album archive, navidrome-style:
 /// `<Album>/<filename>`, with a `Disc NN/` subfolder for multi-disc albums.
 fn album_zip_entry_name(song: &Song, multi_disc: bool) -> String {
-    let file = sanitized_filename(Path::new(&song.path));
+    let file = song_filename(song);
     let album_dir = sanitize_zip_component(song.album_name.as_deref().unwrap_or("Unknown Album"));
     if multi_disc {
         format!(
@@ -513,33 +611,56 @@ fn album_zip_entry_name(song: &Song, multi_disc: bool) -> String {
 fn playlist_zip_entry_name(song: &Song, index: usize) -> String {
     let artist = sanitize_zip_component(song.artist_name.as_deref().unwrap_or("Unknown Artist"));
     let title = sanitize_zip_component(&song.title);
-    format!("{:02} - {artist} - {title}.{}", index + 1, song.suffix)
+    song.cue_track_id.map_or_else(
+        || format!("{:02} - {artist} - {title}.{}", index + 1, song.suffix),
+        |_| {
+            format!(
+                "{:02} - {:02} - {artist} - {title}.flac",
+                index + 1,
+                song.track_number.unwrap_or(0)
+            )
+        },
+    )
 }
 
 /// Stream a zip archive of the given songs as a download attachment.
 ///
 /// The archive is written on a blocking thread into a bounded duplex stream
 /// so large collections don't have to be buffered in memory.
-fn zip_download(
+async fn zip_download(
     auth: &SubsonicContext,
     name: &str,
     entries: Vec<(String, Song)>,
     m3u: Option<(String, String)>,
 ) -> axum::response::Response {
     // Validate all paths up front; entries that fail are skipped
-    let entries: Vec<(String, std::path::PathBuf)> = entries
+    let check_auth = auth.clone();
+    let entries = match tokio::task::spawn_blocking(move || {
+        entries
         .into_iter()
-        .filter_map(|(entry_name, song)| {
-            validate_song_path(&song, auth)
-                .ok()
-                .map(|path| (entry_name, path))
+        .filter_map(|(entry_name, song)| match resolve_audio_blocking(song.id, &check_auth) {
+            Ok(_) => Some((entry_name, song)),
+            Err(error) => {
+                tracing::warn!(song_id = song.id, %error, "ZIP audio source resolution failed");
+                None
+            }
         })
-        .collect();
+        .collect::<Vec<_>>()
+    })
+    .await
+    {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::error!(%error, "ZIP source resolution task failed");
+            return util::service_error(auth, "Failed to resolve audio sources");
+        }
+    };
     if entries.is_empty() {
         return util::not_found(auth, "Audio files not found");
     }
 
     let (writer, reader) = tokio::io::duplex(256 * 1024);
+    let zip_auth = auth.clone();
     tokio::task::spawn_blocking(move || {
         use std::io::Write as _;
 
@@ -548,9 +669,14 @@ fn zip_download(
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Stored);
 
-        for (entry_name, path) in entries {
-            let Ok(mut file) = std::fs::File::open(&path) else {
-                continue;
+        for (entry_name, song) in entries {
+            // Open one source at a time and recheck its fingerprint at use.
+            let mut file = match resolve_audio_blocking(song.id, &zip_auth) {
+                Ok(audio) => audio.reader,
+                Err(error) => {
+                    tracing::warn!(song_id = song.id, %error, "ZIP source unavailable");
+                    continue;
+                }
             };
             if zip.start_file(entry_name, options).is_err() {
                 break;
@@ -779,6 +905,357 @@ mod tests {
     };
     use crate::models::music::Song;
 
+    #[derive(Debug)]
+    struct MediaFixture {
+        path: std::path::PathBuf,
+        pool: crate::db::DbPool,
+        app: axum::Router,
+        root: i32,
+        songs: Vec<Song>,
+    }
+
+    impl MediaFixture {
+        fn new() -> Self {
+            use diesel::connection::SimpleConnection;
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static NEXT: AtomicU32 = AtomicU32::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "suboxide-media-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(path.join("music")).expect("music directory");
+            std::fs::write(
+                path.join("music/image.flac"),
+                crate::flac::tests::image(true),
+            )
+            .expect("image");
+            std::fs::write(
+                path.join("music/ordinary.flac"),
+                crate::flac::tests::image(false),
+            )
+            .expect("ordinary");
+            std::fs::write(path.join("music/album.cue"), "PERFORMER \"Album Artist\"\nTITLE \"Album\"\nFILE \"image.flac\" WAVE\nTRACK 01 AUDIO\nTITLE \"First\"\nINDEX 01 00:00:00\nTRACK 02 AUDIO\nTITLE \"Second\"\nPERFORMER \"Guest\"\nINDEX 01 00:00:01\nTRACK 03 AUDIO\nTITLE \"Last\"\nINDEX 01 00:00:02").expect("sheet");
+            let pool = crate::db::DbConfig {
+                database_url: ":memory:".to_owned(),
+                max_connections: 1,
+                ..crate::db::DbConfig::default()
+            }
+            .build_pool()
+            .expect("pool");
+            crate::db::initialize_database(&mut pool.get().expect("connection")).expect("schema");
+            let hash = crate::crypto::password::hash_password("t").expect("hash");
+            crate::db::UserRepository::new(pool.clone())
+                .create(&crate::db::NewUser::admin("t", &hash, "t"))
+                .expect("user");
+            let root = crate::db::MusicFolderRepository::new(pool.clone())
+                .create(&crate::models::music::NewMusicFolder {
+                    name: "Music".to_owned(),
+                    path: path.join("music").to_string_lossy().into_owned(),
+                    enabled: true,
+                })
+                .expect("root")
+                .id;
+            crate::scanner::Scanner::with_cover_art_dir(pool.clone(), path.join("covers"))
+                .scan(
+                    crate::scanner::ScanTarget::Root(root),
+                    crate::scanner::ScanMode::Full,
+                    None,
+                )
+                .expect("scan");
+            let songs = crate::db::SongRepository::new(pool.clone())
+                .find_by_directory(root)
+                .expect("songs");
+            let cue: Vec<_> = songs
+                .iter()
+                .filter(|song| song.cue_track_id.is_some())
+                .collect();
+            let mut conn = pool.get().expect("connection");
+            conn.batch_execute(
+                "INSERT INTO playlists (id, user_id, name) VALUES (1, 1, 'CUE playlist')",
+            )
+            .expect("playlist");
+            for (position, song) in cue.iter().rev().enumerate() {
+                conn.batch_execute(&format!("INSERT INTO playlist_songs (playlist_id, song_id, position) VALUES (1, {}, {position})", song.id)).expect("playlist track");
+            }
+            drop(conn);
+            let state = crate::app::AppState::new(
+                pool.clone(),
+                crate::lastfm::LastFmClient::new(String::new(), String::new()).expect("disabled"),
+            );
+            let app = crate::app::create_router(state, &crate::app::CorsConfig::default());
+            Self {
+                path,
+                pool,
+                app,
+                root,
+                songs,
+            }
+        }
+
+        async fn request(&self, endpoint: &str, range: Option<&str>) -> axum::response::Response {
+            use tower::ServiceExt;
+            let mut request = axum::http::Request::builder()
+                .uri(format!("/rest/{endpoint}&u=t&p=t&v=1.16.1&c=test&f=json"));
+            if let Some(range) = range {
+                request = request.header(axum::http::header::RANGE, range);
+            }
+            self.app
+                .clone()
+                .oneshot(request.body(axum::body::Body::empty()).expect("request"))
+                .await
+                .expect("response")
+        }
+    }
+
+    impl Drop for MediaFixture {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.path).expect("cleanup fixture");
+        }
+    }
+
+    async fn audio_bytes(response: axum::response::Response) -> Vec<u8> {
+        axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("body")
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn cue_stream_download_ranges_and_every_zip_share_the_virtual_bytes() {
+        use std::io::Read;
+        let fixture = MediaFixture::new();
+        let cue: Vec<_> = fixture
+            .songs
+            .iter()
+            .filter(|song| song.cue_track_id.is_some())
+            .collect();
+        let mut expected = Vec::new();
+        for song in &cue {
+            let stream = fixture
+                .request(&format!("stream?id=mf-{}", song.id), None)
+                .await;
+            assert_eq!(stream.status(), axum::http::StatusCode::OK);
+            assert_eq!(
+                stream.headers()[axum::http::header::CONTENT_TYPE],
+                "audio/flac"
+            );
+            let length = stream.headers()[axum::http::header::CONTENT_LENGTH]
+                .to_str()
+                .expect("length")
+                .parse::<usize>()
+                .expect("number");
+            let bytes = audio_bytes(stream).await;
+            assert_eq!(bytes.len(), length);
+            let download = fixture
+                .request(&format!("download?id=mf-{}", song.id), None)
+                .await;
+            assert!(
+                download.headers()[axum::http::header::CONTENT_DISPOSITION]
+                    .to_str()
+                    .expect("filename")
+                    .contains(&format!("{:02} -", song.track_number.expect("number")))
+            );
+            assert_eq!(audio_bytes(download).await, bytes);
+            for (start, end) in [(0, 3), (35, 75), (length - 9, length - 1)] {
+                let range = fixture
+                    .request(
+                        &format!("stream?id=mf-{}", song.id),
+                        Some(&format!("bytes={start}-{end}")),
+                    )
+                    .await;
+                assert_eq!(range.status(), axum::http::StatusCode::PARTIAL_CONTENT);
+                assert_eq!(
+                    range.headers()[axum::http::header::CONTENT_RANGE],
+                    format!("bytes {start}-{end}/{length}")
+                );
+                assert_eq!(audio_bytes(range).await, bytes[start..=end]);
+            }
+            expected.push((song.track_number.expect("number"), bytes));
+        }
+        for id in [
+            format!("al-{}", cue[0].album_id.expect("album")),
+            format!("ar-{}", cue[0].artist_id.expect("artist")),
+            "pl-1".to_owned(),
+        ] {
+            let response = fixture.request(&format!("download?id={id}"), None).await;
+            assert_eq!(
+                response.headers()[axum::http::header::CONTENT_TYPE],
+                "application/zip"
+            );
+            let mut archive =
+                zip::ZipArchive::new(Cursor::new(audio_bytes(response).await)).expect("ZIP");
+            let mut tracks = 0;
+            for index in 0..archive.len() {
+                let mut entry = archive.by_index(index).expect("entry");
+                if !Path::new(entry.name())
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("flac"))
+                {
+                    continue;
+                }
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).expect("entry audio");
+                let (number, _) = expected
+                    .iter()
+                    .find(|(_, full)| *full == bytes)
+                    .expect("same virtual output");
+                assert!(entry.name().contains(&format!("{number:02} -")));
+                tracks += 1;
+            }
+            assert_eq!(tracks, 3);
+        }
+    }
+
+    #[tokio::test]
+    async fn media_resolver_enforces_source_versions_and_allows_disabled_roots() {
+        let fixture = MediaFixture::new();
+        let cue = fixture
+            .songs
+            .iter()
+            .find(|song| song.cue_track_id.is_some())
+            .expect("CUE song");
+        let ordinary = fixture
+            .songs
+            .iter()
+            .find(|song| song.cue_track_id.is_none())
+            .expect("ordinary song");
+        crate::db::MusicFolderRepository::new(fixture.pool.clone())
+            .set_enabled(fixture.root, false)
+            .expect("disable root");
+        for song in [cue, ordinary] {
+            for endpoint in ["stream", "download"] {
+                let response = fixture
+                    .request(&format!("{endpoint}?id=mf-{}", song.id), None)
+                    .await;
+                assert_eq!(
+                    response.headers()[axum::http::header::CONTENT_TYPE],
+                    "audio/flac"
+                );
+                let bytes = audio_bytes(response).await;
+                assert!(bytes.starts_with(b"fLaC"));
+                if song.cue_track_id.is_none() {
+                    assert_eq!(bytes, std::fs::read(&song.path).expect("ordinary bytes"));
+                }
+            }
+        }
+        for id in [
+            format!("al-{}", cue.album_id.expect("album")),
+            format!("ar-{}", cue.artist_id.expect("artist")),
+            "pl-1".to_owned(),
+        ] {
+            let response = fixture.request(&format!("download?id={id}"), None).await;
+            assert_eq!(
+                response.headers()[axum::http::header::CONTENT_TYPE],
+                "application/zip"
+            );
+            audio_bytes(response).await;
+        }
+        let mut stale = std::fs::read(&cue.path).expect("source");
+        stale.push(0);
+        std::fs::write(&cue.path, &stale).expect("change source");
+        for id in [
+            format!("mf-{}", cue.id),
+            format!("al-{}", cue.album_id.expect("album")),
+            format!("ar-{}", cue.artist_id.expect("artist")),
+            "pl-1".to_owned(),
+        ] {
+            let response = fixture.request(&format!("download?id={id}"), None).await;
+            assert_ne!(
+                response.headers()[axum::http::header::CONTENT_TYPE],
+                "audio/flac"
+            );
+            assert!(
+                String::from_utf8(audio_bytes(response).await)
+                    .expect("error JSON")
+                    .contains("failed")
+            );
+        }
+        let response = fixture
+            .request(&format!("stream?id=mf-{}", cue.id), None)
+            .await;
+        assert!(
+            String::from_utf8(audio_bytes(response).await)
+                .expect("error JSON")
+                .contains("failed")
+        );
+        stale.pop();
+        *stale.last_mut().expect("source footer") ^= 1;
+        std::fs::write(&cue.path, stale).expect("same-size source change");
+        let response = fixture
+            .request(&format!("stream?id=mf-{}", cue.id), None)
+            .await;
+        assert!(
+            String::from_utf8(audio_bytes(response).await)
+                .expect("error JSON")
+                .contains("failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn media_resolver_enforces_root_boundaries_and_roles() {
+        use diesel::connection::SimpleConnection;
+        let fixture = MediaFixture::new();
+        let cue = fixture
+            .songs
+            .iter()
+            .find(|song| song.cue_track_id.is_some())
+            .expect("CUE song");
+        let ordinary = fixture
+            .songs
+            .iter()
+            .find(|song| song.cue_track_id.is_none())
+            .expect("ordinary song");
+        let outside = fixture.path.join("outside.flac");
+        std::fs::copy(&ordinary.path, &outside).expect("outside source");
+        fixture
+            .pool
+            .get()
+            .expect("connection")
+            .batch_execute(&format!("UPDATE songs SET path = '{}'", outside.display()))
+            .expect("outside-root paths");
+        for song in [cue, ordinary] {
+            for endpoint in ["stream", "download"] {
+                let response = fixture
+                    .request(&format!("{endpoint}?id=mf-{}", song.id), None)
+                    .await;
+                assert!(
+                    String::from_utf8(audio_bytes(response).await)
+                        .expect("error JSON")
+                        .contains("failed")
+                );
+            }
+        }
+        for id in [
+            format!("al-{}", cue.album_id.expect("album")),
+            format!("ar-{}", cue.artist_id.expect("artist")),
+            "pl-1".to_owned(),
+        ] {
+            let response = fixture.request(&format!("download?id={id}"), None).await;
+            assert!(
+                String::from_utf8(audio_bytes(response).await)
+                    .expect("error JSON")
+                    .contains("failed")
+            );
+        }
+        fixture
+            .pool
+            .get()
+            .expect("connection")
+            .batch_execute("UPDATE users SET stream_role = FALSE, download_role = FALSE")
+            .expect("roles");
+        for endpoint in ["stream", "download"] {
+            let response = fixture
+                .request(&format!("{endpoint}?id=mf-{}", cue.id), None)
+                .await;
+            assert!(
+                String::from_utf8(audio_bytes(response).await)
+                    .expect("error JSON")
+                    .contains("\"code\":50")
+            );
+        }
+    }
+
     fn test_cover_art_bytes(width: u32, height: u32) -> Vec<u8> {
         let image = DynamicImage::ImageRgba8(ImageBuffer::from_fn(width, height, |x, y| {
             Rgba([(x % 255) as u8, (y % 255) as u8, 128, 255])
@@ -877,6 +1354,7 @@ mod tests {
             album_name: Some("My <Album>".to_string()),
             music_folder_id: 1,
             path: "/music/Album/01 - Track One.flac".to_string(),
+            cue_track_id: None,
             parent_path: "/music/Album".to_string(),
             file_size: 100,
             content_type: "audio/flac".to_string(),

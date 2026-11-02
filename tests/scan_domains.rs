@@ -111,6 +111,474 @@ fn wave(path: &Path, title: &str, seconds: u32) {
         .expect("wave tags");
 }
 
+fn cue_image(path: &Path) {
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("directory");
+    let mut bytes = b"fLaC\x80\0\0\x22".to_vec();
+    let mut info = [0; 34];
+    info[..2].copy_from_slice(&4096_u16.to_be_bytes());
+    info[2..4].copy_from_slice(&4096_u16.to_be_bytes());
+    info[10..18].copy_from_slice(&((8000_u64 << 44) | (15 << 36) | 0x6000).to_be_bytes());
+    bytes.extend(info);
+    for number in 0..6_u8 {
+        let mut frame = vec![0xff, 0xf8, 0xc4, 0x08, number];
+        let crc8 = frame.iter().fold(0_u8, |mut crc, &byte| {
+            crc ^= byte;
+            for _ in 0..8 {
+                crc = (crc << 1) ^ if crc & 0x80 == 0 { 0 } else { 7 };
+            }
+            crc
+        });
+        frame.extend([crc8, 0, number, 0]);
+        let crc16 = frame.iter().fold(0_u16, |mut crc, &byte| {
+            crc ^= u16::from(byte) << 8;
+            for _ in 0..8 {
+                crc = (crc << 1) ^ if crc & 0x8000 == 0 { 0 } else { 0x8005 };
+            }
+            crc
+        });
+        frame.extend(crc16.to_be_bytes());
+        bytes.extend(frame);
+    }
+    std::fs::write(path, bytes).expect("FLAC image");
+}
+
+fn cue_sheet(path: &Path, title: &str, starts: &[&str]) {
+    let mut cue = "PERFORMER \"Artist\"\nTITLE \"Album\"\nFILE \"image.flac\" WAVE\n".to_owned();
+    for (index, start) in starts.iter().enumerate() {
+        use std::fmt::Write;
+        writeln!(
+            cue,
+            "TRACK {:02} AUDIO\nTITLE \"{title} {}\"\nPERFORMER \"Guest {}\"\nINDEX 01 {start}",
+            index + 1,
+            index + 1,
+            index + 1
+        )
+        .expect("string write");
+    }
+    std::fs::write(path, cue).expect("CUE sheet");
+}
+
+fn cue_rows(library: &Library, folder: i32) -> Vec<(i32, String, Option<i32>, i32)> {
+    SongRepository::new(library.pool.clone())
+        .find_by_directory(folder)
+        .expect("rows")
+        .into_iter()
+        .map(|song| (song.id, song.title, song.cue_track_id, song.duration))
+        .collect()
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "Lifecycle transitions share one persisted library and pair"
+)]
+fn cue_lifecycle_preserves_identity_scope_and_failed_publication() {
+    use diesel::connection::SimpleConnection;
+    let _test_lock = SCANNER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let library = Library::new();
+    let root = library.root("first");
+    library.root("second");
+    let image = library.path.join("first/A/image.flac");
+    let sheet = image.with_file_name("album.cue");
+    cue_image(&image);
+    for path in [
+        "first/B/song.wav",
+        "first/A/child/song.wav",
+        "second/song.wav",
+    ] {
+        wave(&library.path.join(path), "Untouched", 2);
+    }
+    let scanner = library.scanner();
+    scanner
+        .scan(ScanTarget::AllEnabled, ScanMode::Full, None)
+        .expect("ordinary scan");
+    let owner = library.folder(root, "A").id;
+    let untouched: Vec<_> = library
+        .songs()
+        .into_iter()
+        .filter(|song| song.music_folder_id != owner)
+        .map(|song| (song.id, song.title, song.updated_at))
+        .collect();
+    let target = ScanTarget::Directory {
+        root_id: root,
+        path: "A".into(),
+    };
+    let starts = ["00:00:00", "00:01:00", "00:02:00"];
+    cue_sheet(&sheet, "Track", &starts);
+    scanner
+        .scan(target.clone(), ScanMode::Full, None)
+        .expect("CUE scan");
+    let rows = cue_rows(&library, owner);
+    assert_eq!(rows.len(), 3);
+    assert!(
+        rows.iter()
+            .all(|(_, _, cue, duration)| cue.is_some() && *duration == 1)
+    );
+    let album = SongRepository::new(library.pool.clone())
+        .find_by_directory(owner)
+        .expect("songs")[0]
+        .album_id
+        .expect("album");
+    assert_album(&library, album, 6, 9);
+    let skipped = scanner
+        .scan(target.clone(), ScanMode::Incremental, None)
+        .expect("unchanged pair");
+    assert_eq!(skipped.tracks_skipped, 3);
+    assert_eq!(skipped.tracks_updated, 0);
+    assert_eq!(cue_rows(&library, owner), rows);
+    cue_sheet(&sheet, "Renamed", &starts[..2]);
+    scanner
+        .scan(target.clone(), ScanMode::Incremental, None)
+        .expect("changed sheet");
+    let changed = cue_rows(&library, owner);
+    assert_eq!(changed.len(), 2);
+    assert_eq!(
+        changed.iter().map(|row| row.0).collect::<Vec<_>>(),
+        rows[..2].iter().map(|row| row.0).collect::<Vec<_>>()
+    );
+    assert_eq!(changed[1].3, 2);
+    let repo = SongRepository::new(library.pool.clone());
+    let source = repo
+        .cue_source(sheet.to_str().expect("path"))
+        .expect("source");
+    cue_sheet(&sheet, "Invalid", &["00:00:00", "00:00:01", "00:00:02"]);
+    assert!(
+        scanner
+            .scan(target.clone(), ScanMode::Full, None)
+            .expect("failed indexing reported")
+            .tracks_failed
+            > 0
+    );
+    assert_eq!(cue_rows(&library, owner), changed);
+    assert_eq!(
+        repo.cue_source(sheet.to_str().expect("path"))
+            .expect("source"),
+        source
+    );
+    cue_sheet(&sheet, "Atomic", &starts);
+    library.pool.get().expect("connection").batch_execute("CREATE TRIGGER fail_cue_publication BEFORE INSERT ON cue_sources BEGIN SELECT RAISE(ABORT, 'injected publication failure'); END;").expect("trigger");
+    assert!(scanner.scan(target.clone(), ScanMode::Full, None).is_err());
+    assert_eq!(cue_rows(&library, owner), changed);
+    assert_eq!(
+        repo.cue_source(sheet.to_str().expect("path"))
+            .expect("source"),
+        source
+    );
+    library
+        .pool
+        .get()
+        .expect("connection")
+        .batch_execute("DROP TRIGGER fail_cue_publication;")
+        .expect("drop trigger");
+    std::fs::remove_file(&sheet).expect("remove sheet");
+    let saved_image = std::fs::read(&image).expect("source bytes");
+    std::fs::write(&image, b"unreadable audio metadata").expect("break ordinary restore");
+    assert!(
+        scanner
+            .scan(target.clone(), ScanMode::Incremental, None)
+            .expect("restore failure")
+            .tracks_failed
+            > 0
+    );
+    assert_eq!(cue_rows(&library, owner), changed);
+    assert_eq!(
+        repo.cue_source(sheet.to_str().expect("path"))
+            .expect("retained source"),
+        source
+    );
+    std::fs::write(&image, saved_image).expect("restore audio");
+    scanner
+        .scan(target.clone(), ScanMode::Incremental, None)
+        .expect("restore ordinary image");
+    assert_eq!(cue_rows(&library, owner).len(), 1);
+    assert!(cue_rows(&library, owner)[0].2.is_none());
+    assert!(
+        repo.cue_source(sheet.to_str().expect("path"))
+            .expect("source removed")
+            .is_none()
+    );
+    cue_sheet(&sheet, "Again", &starts);
+    scanner
+        .scan(target.clone(), ScanMode::Full, None)
+        .expect("restore CUE pair");
+    std::fs::remove_file(&image).expect("remove image");
+    scanner
+        .scan(target, ScanMode::Incremental, None)
+        .expect("remove CUE tracks");
+    assert!(cue_rows(&library, owner).is_empty());
+    assert_eq!(
+        library
+            .songs()
+            .into_iter()
+            .map(|song| (song.id, song.title, song.updated_at))
+            .collect::<Vec<_>>(),
+        untouched
+    );
+}
+
+#[test]
+fn cue_source_changes_and_incomplete_discovery_preserve_indexed_state() {
+    use diesel::connection::SimpleConnection;
+    let _test_lock = SCANNER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let library = Library::new();
+    let root = library.root("music");
+    let image = library.path.join("music/A/image.flac");
+    let sheet = image.with_file_name("album.cue");
+    cue_image(&image);
+    let starts = ["00:00:00", "00:01:00", "00:02:00"];
+    cue_sheet(&sheet, "Track", &starts);
+    let scanner = library.scanner();
+    scanner
+        .scan(ScanTarget::Root(root), ScanMode::Full, None)
+        .expect("index");
+    let owner = library.folder(root, "A").id;
+    let target = directory(root, "A");
+    let rows = cue_rows(&library, owner);
+    library.pool.get().expect("connection").batch_execute(&format!("INSERT INTO users (id, username, password_hash) VALUES (1, 'cue-listener', 'hash'); INSERT INTO bookmarks (user_id, song_id, position) VALUES (1, {}, 1234);", rows[0].0)).expect("personal reference");
+    let repo = SongRepository::new(library.pool.clone());
+    let source = repo
+        .cue_source(sheet.to_str().expect("path"))
+        .expect("source");
+    let original = std::fs::read(&image).expect("source bytes");
+    let mut broken = original.clone();
+    *broken.last_mut().expect("footer") ^= 1;
+    std::fs::write(&image, &broken).expect("corrupt image");
+    assert!(
+        scanner
+            .scan(target.clone(), ScanMode::Full, None)
+            .expect("index failure")
+            .tracks_failed
+            > 0
+    );
+    assert_eq!(cue_rows(&library, owner), rows);
+    assert_eq!(
+        repo.cue_source(sheet.to_str().expect("path"))
+            .expect("preserved source"),
+        source
+    );
+    std::fs::write(&image, &original).expect("restore source");
+    let updated = scanner
+        .scan(target.clone(), ScanMode::Incremental, None)
+        .expect("changed image");
+    assert_eq!(updated.tracks_updated, 3);
+    assert_eq!(cue_rows(&library, owner), rows);
+    let original_tracks = typed_cue_rows(&library).1;
+    cue_sheet(&sheet, "Changed", &["00:00:00", "00:01:30", "00:02:20"]);
+    scanner
+        .scan(target.clone(), ScanMode::Incremental, None)
+        .expect("boundary changes");
+    let changed = cue_rows(&library, owner);
+    assert_eq!(
+        changed.iter().map(|row| row.0).collect::<Vec<_>>(),
+        rows.iter().map(|row| row.0).collect::<Vec<_>>()
+    );
+    assert_eq!(changed[0].2, rows[0].2, "retained relational identity");
+    assert_ne!(
+        typed_cue_rows(&library).1[0].end_frame,
+        original_tracks[0].end_frame
+    );
+    let positions = suboxide::db::BookmarkRepository::new(library.pool.clone())
+        .get_positions_for_songs(1, &[rows[0].0])
+        .expect("retained bookmark");
+    assert_eq!(positions.get(&rows[0].0), Some(&1234));
+    let failed = image;
+    let (result, _) = observe_with(
+        move |event| {
+            if event.name == "scan.entry.classify"
+                && event.fields.get("path") == Some(&failed.to_string_lossy().into_owned())
+            {
+                std::fs::remove_file(&failed).expect("inject incomplete listing");
+            }
+        },
+        || {
+            scanner
+                .scan(target, ScanMode::Full, None)
+                .expect("partial listing")
+        },
+    );
+    assert!(result.tracks_failed > 0);
+    assert_eq!(cue_rows(&library, owner), changed);
+}
+
+#[test]
+fn cue_incomplete_sheet_classification_does_not_publish_an_image_duplicate() {
+    let _test_lock = SCANNER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let library = Library::new();
+    let root = library.root("music");
+    let image = library.path.join("music/A/image.flac");
+    let sheet = image.with_file_name("album.cue");
+    cue_image(&image);
+    cue_sheet(&sheet, "Track", &["00:00:00", "00:01:00", "00:02:00"]);
+    let scanner = library.scanner();
+    scanner
+        .scan(ScanTarget::Root(root), ScanMode::Full, None)
+        .expect("index");
+    let owner = library.folder(root, "A").id;
+    let before = cue_rows(&library, owner);
+    let (result, _) = observe_with(
+        move |event| {
+            if event.name == "scan.entry.classify"
+                && event.fields.get("path") == Some(&sheet.to_string_lossy().into_owned())
+            {
+                std::fs::remove_file(&sheet).expect("inject incomplete classification");
+            }
+        },
+        || {
+            scanner
+                .scan(directory(root, "A"), ScanMode::Full, None)
+                .expect("partial listing")
+        },
+    );
+    assert!(result.tracks_failed > 0);
+    assert_eq!(cue_rows(&library, owner), before);
+}
+
+#[test]
+fn cue_failed_existing_sheet_blocks_another_sheet_claiming_its_image() {
+    let _test_lock = SCANNER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for failure in ["parse", "classify"] {
+        let library = Library::new();
+        let root = library.root("music");
+        let image = library.path.join("music/A/image.flac");
+        let first = image.with_file_name("album.cue");
+        let second = image.with_file_name("other.cue");
+        let starts = ["00:00:00", "00:01:00", "00:02:00"];
+        cue_image(&image);
+        cue_sheet(&first, "First", &starts);
+        let scanner = library.scanner();
+        scanner
+            .scan(ScanTarget::Root(root), ScanMode::Full, None)
+            .expect("index");
+        let owner = library.folder(root, "A").id;
+        let before = cue_rows(&library, owner);
+        let repo = SongRepository::new(library.pool.clone());
+        let source = repo
+            .cue_source(first.to_str().expect("path"))
+            .expect("source");
+        cue_sheet(&second, "Second", &starts);
+        if failure == "parse" {
+            std::fs::write(&first, b"not a CUE sheet").expect("parse failure");
+        }
+        let failed = first.clone();
+        let (result, _) = observe_with(
+            move |event| {
+                if failure == "classify"
+                    && event.name == "scan.entry.classify"
+                    && event.fields.get("path") == Some(&failed.to_string_lossy().into_owned())
+                {
+                    std::fs::remove_file(&failed).expect("classification failure");
+                }
+            },
+            || {
+                scanner
+                    .scan(directory(root, "A"), ScanMode::Full, None)
+                    .expect("failed pair")
+            },
+        );
+        assert!(result.tracks_failed > 0);
+        assert_eq!(cue_rows(&library, owner), before);
+        assert_eq!(
+            repo.cue_source(first.to_str().expect("path"))
+                .expect("old source"),
+            source
+        );
+        assert!(
+            repo.cue_source(second.to_str().expect("path"))
+                .expect("new source")
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn cue_retarget_releases_its_image_only_after_successful_replacement() {
+    let _test_lock = SCANNER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (first_name, second_name, replacement_valid) in [
+        ("a.cue", "z.cue", true),
+        ("z.cue", "a.cue", true),
+        ("old.cue", "new.cue", false),
+    ] {
+        let library = Library::new();
+        let root = library.root("music");
+        let image = library.path.join("music/A/image.flac");
+        let other = image.with_file_name("other.flac");
+        let first = image.with_file_name(first_name);
+        let second = image.with_file_name(second_name);
+        let starts = ["00:00:00", "00:01:00", "00:02:00"];
+        cue_image(&image);
+        cue_image(&other);
+        cue_sheet(&first, "First", &starts);
+        let scanner = library.scanner();
+        scanner
+            .scan(ScanTarget::Root(root), ScanMode::Full, None)
+            .expect("index");
+        let owner = library.folder(root, "A").id;
+        let before = cue_rows(&library, owner);
+        let old_ids: Vec<_> = before
+            .iter()
+            .filter(|row| row.2.is_some())
+            .map(|row| row.0)
+            .collect();
+        let repo = SongRepository::new(library.pool.clone());
+        let old_source = repo
+            .cue_source(first.to_str().expect("path"))
+            .expect("source");
+        cue_sheet(&second, "Second", &starts);
+        let retargeted = std::fs::read_to_string(&first)
+            .expect("sheet")
+            .replace("image.flac", "other.flac");
+        std::fs::write(&first, retargeted).expect("retarget");
+        if !replacement_valid {
+            std::fs::write(&other, b"corrupt replacement").expect("break replacement");
+        }
+        let result = scanner
+            .scan(directory(root, "A"), ScanMode::Full, None)
+            .expect("selected update");
+        if replacement_valid {
+            assert_eq!(result.tracks_failed, 0);
+            let songs = repo.find_by_directory(owner).expect("songs");
+            assert_eq!(songs.len(), 6);
+            assert!(songs.iter().all(|song| song.cue_track_id.is_some()));
+            assert_eq!(
+                songs
+                    .iter()
+                    .filter(|song| song.path == other.to_string_lossy())
+                    .map(|song| song.id)
+                    .collect::<Vec<_>>(),
+                old_ids
+            );
+            assert!(
+                repo.cue_source(second.to_str().expect("path"))
+                    .expect("new source")
+                    .is_some()
+            );
+        } else {
+            assert!(result.tracks_failed > 0);
+            assert_eq!(cue_rows(&library, owner), before);
+            assert_eq!(
+                repo.cue_source(first.to_str().expect("path"))
+                    .expect("old source"),
+                old_source
+            );
+            assert!(
+                repo.cue_source(second.to_str().expect("path"))
+                    .expect("new source")
+                    .is_none()
+            );
+        }
+    }
+}
+
 fn retag(path: &Path, update: impl FnOnce(&mut lofty::tag::Tag)) {
     use lofty::file::TaggedFileExt;
     use lofty::tag::TagExt;
@@ -1375,4 +1843,174 @@ fn asd_03_cli_dispatch_in_both_modes() {
         }
     }
     assert_eq!(library.songs().len(), 5);
+}
+
+fn typed_cue_rows(
+    library: &Library,
+) -> (
+    Vec<suboxide::models::music::CueSource>,
+    Vec<suboxide::models::music::CueTrack>,
+) {
+    use suboxide::models::music::{CueSource, CueTrack};
+    let mut conn = library.pool.get().expect("connection");
+    (
+        diesel::sql_query("SELECT * FROM cue_sources ORDER BY id")
+            .load::<CueSource>(&mut conn)
+            .expect("sources"),
+        diesel::sql_query("SELECT * FROM cue_tracks ORDER BY id")
+            .load::<CueTrack>(&mut conn)
+            .expect("tracks"),
+    )
+}
+
+#[test]
+fn cue_publication_rejects_inconsistent_song_metadata_and_boundaries_atomically() {
+    use diesel::connection::SimpleConnection;
+    let _test_lock = SCANNER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let library = Library::new();
+    let root = library.root("music");
+    let other = library.root("other");
+    let image = library.path.join("music/A/image.flac");
+    let sheet = image.with_file_name("album.cue");
+    cue_image(&image);
+    cue_sheet(&sheet, "Original", &["00:00:00", "00:01:00", "00:02:00"]);
+    let scanner = library.scanner();
+    scanner
+        .scan(ScanTarget::Root(root), ScanMode::Full, None)
+        .expect("index");
+    let owner = library.folder(root, "A").id;
+    let songs = cue_rows(&library, owner);
+    let relational = typed_cue_rows(&library);
+    cue_sheet(&sheet, "Replacement", &["00:00:00", "00:01:30", "00:02:00"]);
+    for mutation in [
+        "UPDATE songs SET sampling_rate = NULL WHERE id = NEW.id".to_owned(),
+        "UPDATE songs SET channel_count = 9 WHERE id = NEW.id".to_owned(),
+        "UPDATE songs SET bit_depth = 33 WHERE id = NEW.id".to_owned(),
+        "UPDATE songs SET path = '/outside/image.flac' WHERE id = NEW.id".to_owned(),
+        format!("UPDATE songs SET music_folder_id = {other} WHERE id = NEW.id"),
+        "UPDATE songs SET track_number = 99 WHERE id = NEW.id".to_owned(),
+        "UPDATE cue_tracks SET byte_start = byte_start + 1 WHERE id = NEW.cue_track_id".to_owned(),
+        "UPDATE cue_tracks SET end_frame = end_frame + 1 WHERE id = NEW.cue_track_id".to_owned(),
+    ] {
+        library.pool.get().expect("connection").batch_execute(&format!(
+            "CREATE TRIGGER corrupt_publication AFTER UPDATE ON songs WHEN NEW.cue_track_id IS NOT NULL BEGIN {mutation}; END;"
+        )).expect("trigger");
+        assert!(
+            scanner
+                .scan(directory(root, "A"), ScanMode::Full, None)
+                .is_err(),
+            "reject {mutation}"
+        );
+        assert_eq!(cue_rows(&library, owner), songs);
+        assert_eq!(typed_cue_rows(&library), relational);
+        library
+            .pool
+            .get()
+            .expect("connection")
+            .batch_execute("DROP TRIGGER corrupt_publication")
+            .expect("drop trigger");
+    }
+}
+
+#[test]
+fn cue_image_exchange_retains_all_identities_and_personal_references_then_cleans_up() {
+    use diesel::connection::SimpleConnection;
+    #[derive(QueryableByName)]
+    struct Reference {
+        #[diesel(sql_type = diesel::sql_types::Integer)]
+        song_id: i32,
+    }
+    let _test_lock = SCANNER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let library = Library::new();
+    let root = library.root("music");
+    let image = library.path.join("music/A/image.flac");
+    let other = image.with_file_name("other.flac");
+    let first = image.with_file_name("first.cue");
+    let second = image.with_file_name("second.cue");
+    cue_image(&image);
+    cue_image(&other);
+    for sheet in [&first, &second] {
+        cue_sheet(sheet, "Track", &["00:00:00", "00:01:00", "00:02:00"]);
+    }
+    let second_content = std::fs::read_to_string(&second)
+        .expect("sheet")
+        .replace("image.flac", "other.flac");
+    std::fs::write(&second, &second_content).expect("second source");
+    let scanner = library.scanner();
+    scanner
+        .scan(ScanTarget::Root(root), ScanMode::Full, None)
+        .expect("index");
+    let owner = library.folder(root, "A").id;
+    let before = cue_rows(&library, owner);
+    let relational = typed_cue_rows(&library);
+    library
+        .pool
+        .get()
+        .expect("connection")
+        .batch_execute(
+            "INSERT INTO users (id, username, password_hash) VALUES (1, 'listener', 'hash')",
+        )
+        .expect("listener");
+    for song in &before {
+        library
+            .pool
+            .get()
+            .expect("connection")
+            .batch_execute(&format!(
+                "INSERT INTO bookmarks (user_id, song_id, position) VALUES (1, {}, 1234)",
+                song.0
+            ))
+            .expect("bookmark");
+    }
+    let first_content = std::fs::read_to_string(&first)
+        .expect("sheet")
+        .replace("image.flac", "other.flac");
+    std::fs::write(&first, first_content).expect("first exchange");
+    std::fs::write(&second, second_content.replace("other.flac", "image.flac"))
+        .expect("second exchange");
+    let result = scanner
+        .scan(directory(root, "A"), ScanMode::Full, None)
+        .expect("exchange");
+    assert_eq!(result.tracks_failed, 0);
+    assert_eq!(cue_rows(&library, owner), before);
+    let current = typed_cue_rows(&library);
+    assert_eq!(
+        current.0.iter().map(|s| s.id).collect::<Vec<_>>(),
+        relational.0.iter().map(|s| s.id).collect::<Vec<_>>()
+    );
+    assert_eq!(current.1, relational.1);
+    let references = diesel::sql_query("SELECT song_id FROM bookmarks ORDER BY song_id")
+        .load::<Reference>(&mut library.pool.get().expect("connection"))
+        .expect("references")
+        .into_iter()
+        .map(|r| r.song_id)
+        .collect::<Vec<_>>();
+    let mut ids = before.iter().map(|s| s.0).collect::<Vec<_>>();
+    ids.sort_unstable();
+    assert_eq!(references, ids);
+    let repo = SongRepository::new(library.pool.clone());
+    for song in library.songs() {
+        let snapshot = repo.audio_source(song.id).expect("snapshot").expect("song");
+        let (_, source) = snapshot.cue.expect("CUE source");
+        let expected = if source.sheet_path == first.to_string_lossy() {
+            &other
+        } else {
+            &image
+        };
+        assert_eq!(Path::new(&song.path), expected);
+    }
+    MusicFolderRepository::new(library.pool.clone())
+        .delete(root)
+        .expect("root removal");
+    assert_eq!(typed_cue_rows(&library), (Vec::new(), Vec::new()));
+    assert!(
+        suboxide::db::BookmarkRepository::new(library.pool.clone())
+            .get_positions_for_songs(1, &ids)
+            .expect("bookmarks after removal")
+            .is_empty()
+    );
 }
