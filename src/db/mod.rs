@@ -5,7 +5,7 @@ pub mod repo;
 pub(crate) mod schema;
 
 #[doc(inline)]
-pub use connection::{DbConfig, DbConn, DbPool, DbPoolError, run_migrations};
+pub use connection::{DbConfig, DbConn, DbPool, DbPoolError, initialize_database};
 #[doc(inline)]
 pub use repo::{
     AlbumRepository, ArtistInfoCacheRepository, ArtistRepository, BookmarkEntry,

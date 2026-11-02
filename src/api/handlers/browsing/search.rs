@@ -261,6 +261,8 @@ pub async fn search2(
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct SearchParams {
+    #[serde(rename = "musicFolderId")]
+    pub music_folder_id: Option<i32>,
     /// Artist to search for.
     pub artist: Option<String>,
     /// Album to search for.
@@ -297,7 +299,10 @@ pub async fn search(
         .or(params.artist.as_deref())
         .unwrap_or("");
 
-    let songs = match auth.music().search_songs(query, None, offset, count) {
+    let songs = match auth
+        .music()
+        .search_songs(query, params.music_folder_id, offset, count)
+    {
         Ok(songs) => songs,
         Err(error) => {
             return util::repo_error(&auth, error);

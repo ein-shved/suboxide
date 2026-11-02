@@ -34,35 +34,11 @@ pub async fn get_music_directory(
             return util::not_found(&auth, "Directory");
         }
         EntityId::Song(id) => {
-            // Bare integer: fall back to album/artist/folder precedence below
-            let folders = match auth.music().get_music_folders() {
-                Ok(folders) => folders,
-                Err(e) => {
-                    return util::repo_error(&auth, e);
-                }
+            let folder = match auth.music().get_music_folder(id) {
+                Ok(folder) => folder,
+                Err(error) => return util::repo_error(&auth, error),
             };
-
-            let maybe_album = match auth.music().get_album(id) {
-                Ok(album) => album,
-                Err(e) => {
-                    return util::repo_error(&auth, e);
-                }
-            };
-            if maybe_album.is_some() {
-                return album_directory(&auth, id);
-            }
-
-            let maybe_artist = match auth.music().get_artist(id) {
-                Ok(artist) => artist,
-                Err(e) => {
-                    return util::repo_error(&auth, e);
-                }
-            };
-            if maybe_artist.is_some() {
-                return artist_directory(&auth, id);
-            }
-
-            if let Some(folder) = folders.iter().find(|f| f.id == id) {
+            if let Some(folder) = folder {
                 let artists = match auth.music().get_artists_by_music_folder(folder.id) {
                     Ok(artists) => artists,
                     Err(e) => {
@@ -73,7 +49,7 @@ pub async fn get_music_directory(
                     .iter()
                     .map(ChildResponse::from_artist_as_dir)
                     .collect();
-                let response = DirectoryResponse::from_music_folder(folder, children);
+                let response = DirectoryResponse::from_music_folder(&folder, children);
                 return SubsonicResponse::directory(auth.format, response).into_response();
             }
         }

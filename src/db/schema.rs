@@ -45,6 +45,7 @@ diesel::table! {
         id -> Integer,
         name -> Text,
         path -> Text,
+        parent -> Nullable<Integer>,
         enabled -> Bool,
         created_at -> Timestamp,
         updated_at -> Timestamp,

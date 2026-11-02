@@ -190,7 +190,7 @@ The server advertises the following extensions from `getOpenSubsonicExtensions`:
 - `download` accepts song, album, artist, and playlist ids. Albums and artists download as a zip archive (with `Disc NN/` subfolders for multi-disc albums); playlists download as numbered tracks plus an M3U playlist file.
 - API ids are namespaced per entity type (navidrome-style): `mf-` for songs, `al-` for albums, `ar-` for artists, `pl-` for playlists. Bare integers are accepted as song ids for backwards compatibility.
 - `getIndexes` honors the `ifModifiedSince` parameter, returning an empty index list with the current `lastModified` when nothing has changed.
-- `startScan` is admin-only; pass `fullScan=true` to rescan the entire library, or omit it for an incremental scan.
+- `startScan` is admin-only. `fullScan=true` rereads every audio file in the selected scope; otherwise scanning is incremental.
 - Remote control support is exposed through the OpenSubsonic `remoteControl` extension. It supports host/controller pairing, queued commands, and playback state synchronization.
 
 ### Authentication
@@ -233,6 +233,27 @@ cargo fmt --check
 # Run linter
 cargo clippy
 ```
+
+## Scan selection
+
+`suboxide scan` scans enabled registered roots recursively. Use `--folder ID`
+for one root, or `--folder ID --directory PATH` for only that directory's
+direct audio files. `PATH` is root-relative; `.` or an empty path selects the
+root's direct files. Add `--full` to reread unchanged files in that scope.
+Directory updates leave child and sibling tracks untouched.
+
+Admin `startScan` uses the same selection through `musicFolderId`, `directory`,
+and `fullScan`. Directory selection requires a root ID. Absolute paths, `..`,
+symlink components, generated-folder IDs, and disabled roots are rejected.
+Missing paths remove indexed tracks only when a successful listing proves
+their absence; filesystem failures preserve unproven entries.
+
+`folder list` shows registered roots, including disabled roots;
+`getMusicFolders` shows enabled roots. Public `musicFolderId` filters include
+nested songs, artists, and albums before pagination. Unknown and generated
+IDs match nothing. Unfiltered views retain disabled roots' indexed tracks;
+shared album details include all indexed members. Removing a root deletes
+its indexed subtree and updates affected albums, retaining other roots' songs.
 
 ## Project Structure
 

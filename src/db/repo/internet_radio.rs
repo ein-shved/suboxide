@@ -124,7 +124,7 @@ impl InternetRadioRepository {
 #[cfg(test)]
 mod tests {
     use super::InternetRadioRepository;
-    use crate::db::{DbConfig, DbPool, run_migrations};
+    use crate::db::{DbConfig, DbPool, initialize_database};
 
     fn test_pool() -> DbPool {
         let config = DbConfig {
@@ -133,8 +133,8 @@ mod tests {
             ..DbConfig::default()
         };
         let pool = config.build_pool().expect("pool must build");
-        run_migrations(&mut pool.get().expect("connection must checkout"))
-            .expect("migrations must run");
+        initialize_database(&mut pool.get().expect("connection must checkout"))
+            .expect("schema must initialize");
         pool
     }
 

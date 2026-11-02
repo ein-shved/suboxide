@@ -9,7 +9,6 @@ use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::tag::{Accessor, ItemKey};
 use rayon::prelude::*;
 use tokio::sync::watch;
-use walkdir::WalkDir;
 
 use crate::cover_art::{content_hash, extension_from_mime, mime_from_extension};
 use crate::db::{DbPool, MusicFolderRepository, MusicRepoError};
@@ -18,7 +17,7 @@ use crate::paths::resolve_cover_art_dir;
 use crate::scanner::state::{ScanPhase, ScanStateHandle};
 use crate::scanner::types::{
     AUDIO_EXTENSIONS, BATCH_SIZE, COVER_ART_FILENAMES, DEFAULT_AUTO_SCAN_INTERVAL_SECS,
-    IMAGE_EXTENSIONS, PreparedTrack, ScanError, ScanMode, ScanResult, ScannedTrack,
+    IMAGE_EXTENSIONS, PreparedTrack, ScanError, ScanMode, ScanResult, ScanTarget, ScannedTrack,
 };
 
 /// Music library scanner.
@@ -49,6 +48,16 @@ struct ExistingSong {
     file_modified_at: Option<i64>,
     file_size: i64,
     album_id: Option<i32>,
+}
+
+#[derive(Debug, Default)]
+struct DirectoryListing {
+    files: Vec<DiscoveredFile>,
+    audio_paths: HashSet<String>,
+    entries: HashSet<PathBuf>,
+    children: Vec<PathBuf>,
+    complete: bool,
+    failures: usize,
 }
 
 enum AutoScanOutcome {
@@ -153,256 +162,281 @@ impl Scanner {
         None
     }
 
-    /// Scan all enabled music folders (full scan).
-    pub fn scan_all(&self) -> Result<ScanResult, ScanError> {
-        self.scan_all_with_options(None, ScanMode::Full)
+    /// Normalize and validate a selection before starting background work.
+    pub fn resolve_target(&self, target: ScanTarget) -> Result<ScanTarget, ScanError> {
+        let folders = MusicFolderRepository::new(self.pool.clone());
+        match target {
+            ScanTarget::AllEnabled => {
+                if folders.find_enabled()?.is_empty() {
+                    return Err(ScanError::NoMusicFolders);
+                }
+                Ok(ScanTarget::AllEnabled)
+            }
+            ScanTarget::Root(id) => {
+                self.selected_root(id)?;
+                Ok(ScanTarget::Root(id))
+            }
+            ScanTarget::Directory { root_id, path } => {
+                let root = self.selected_root(root_id)?;
+                let relative = crate::db::repo::music::normalize_directory_path(&path)
+                    .map_err(|error| ScanError::InvalidTarget(error.to_string()))?;
+                let mut current = PathBuf::from(&root.path);
+                Self::validate_component(&current)?;
+                for component in Path::new(&relative).components() {
+                    current.push(component);
+                    Self::validate_component(&current)?;
+                }
+                Ok(ScanTarget::Directory {
+                    root_id,
+                    path: relative.into(),
+                })
+            }
+        }
     }
 
-    /// Scan all enabled music folders (incremental - only changed files).
-    pub fn scan_all_incremental(&self) -> Result<ScanResult, ScanError> {
-        self.scan_all_with_options(None, ScanMode::Incremental)
+    fn selected_root(&self, id: i32) -> Result<MusicFolder, ScanError> {
+        let root = MusicFolderRepository::new(self.pool.clone())
+            .find_by_id(id)?
+            .filter(|folder| folder.parent.is_none())
+            .ok_or_else(|| ScanError::FolderNotFound(id.to_string()))?;
+        if !root.enabled {
+            return Err(ScanError::InvalidTarget(format!("root {id} is disabled")));
+        }
+        Ok(root)
     }
 
-    /// Scan all enabled music folders with optional progress tracking.
-    ///
-    /// If a `ScanState` is provided, the count will be updated as tracks are processed.
-    pub fn scan_all_with_state(
+    fn validate_component(path: &Path) -> Result<(), ScanError> {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_symlink() || !metadata.is_dir() => Err(
+                ScanError::InvalidTarget(format!("{} is not a plain directory", path.display())),
+            ),
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Apply the same direct-directory boundary to all scan targets.
+    pub fn scan(
         &self,
-        state: Option<&ScanStateHandle>,
-    ) -> Result<ScanResult, ScanError> {
-        self.scan_all_with_options(state, ScanMode::Full)
-    }
-
-    /// Scan all enabled music folders with optional progress tracking and scan mode.
-    pub fn scan_all_with_options(
-        &self,
-        state: Option<&ScanStateHandle>,
+        target: ScanTarget,
         mode: ScanMode,
+        state: Option<&ScanStateHandle>,
     ) -> Result<ScanResult, ScanError> {
-        let folder_repo = MusicFolderRepository::new(self.pool.clone());
-        let folders = folder_repo.find_enabled()?;
-
-        if folders.is_empty() {
-            return Err(ScanError::NoMusicFolders);
+        let target = self.resolve_target(target)?;
+        if let Some(state) = state {
+            state.set_phase(ScanPhase::Discovering);
         }
-
-        let mut total_result = ScanResult::default();
-
-        for folder in &folders {
-            // Update scan state with current folder
-            if let Some(s) = state {
-                s.set_current_folder(Some(folder.name.clone()));
-            }
-
-            tracing::event!(
-                name: "scan.folder.started",
-                tracing::Level::INFO,
-                folder.name = %folder.name,
-                folder.path = %folder.path,
-                scan.mode = ?mode,
-                "scanning folder"
-            );
-            match self.scan_folder_with_options(folder, state, mode) {
-                Ok(result) => {
-                    total_result.tracks_found += result.tracks_found;
-                    total_result.tracks_added += result.tracks_added;
-                    total_result.tracks_updated += result.tracks_updated;
-                    total_result.tracks_skipped += result.tracks_skipped;
-                    total_result.tracks_removed += result.tracks_removed;
-                    total_result.tracks_failed += result.tracks_failed;
-                    total_result.artists_added += result.artists_added;
-                    total_result.albums_added += result.albums_added;
-                    total_result.cover_art_saved += result.cover_art_saved;
-                }
-                Err(e) => {
-                    tracing::event!(
-                        name: "scan.folder.failed",
-                        tracing::Level::ERROR,
-                        folder.name = %folder.name,
-                        error = %e,
-                        "error scanning folder"
-                    );
-                    return Err(e);
+        let result = match target {
+            ScanTarget::Directory { root_id, path } => {
+                let root = self.selected_root(root_id)?;
+                let absolute = Self::directory_path(&root, &path);
+                match Self::discover_entries(&absolute) {
+                    Ok(listing) => {
+                        let result = self.scan_directory(&root, &path, &listing, mode, state)?;
+                        self.prune_directory(&root, &path, &listing)?;
+                        result
+                    }
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::NotFound
+                            && !path.as_os_str().is_empty()
+                            && Self::proven_absent(&absolute)? =>
+                    {
+                        self.remove_direct(&root, &path)?
+                    }
+                    Err(error) => return Err(error.into()),
                 }
             }
+            recursive => {
+                let folders = match recursive {
+                    ScanTarget::AllEnabled => {
+                        MusicFolderRepository::new(self.pool.clone()).find_enabled()?
+                    }
+                    ScanTarget::Root(id) => vec![self.selected_root(id)?],
+                    ScanTarget::Directory { .. } => unreachable!("directory handled above"),
+                };
+                let mut result = ScanResult::default();
+                for root in folders {
+                    if let Some(state) = state {
+                        state.set_current_folder(Some(root.name.clone()));
+                    }
+                    result += self.scan_tree(&root, Path::new(""), mode, state)?;
+                }
+                result
+            }
+        };
+        if let Some(state) = state {
+            state.set_phase(ScanPhase::Cleaning);
         }
-
-        // Clean up orphaned artists and albums after scanning all folders
-        if let Some(s) = state {
-            s.set_phase(ScanPhase::Cleaning);
-            s.set_current_folder(None);
-        }
-
-        if let Err(e) = self.cleanup_orphans() {
-            return Err(ScanError::Cleanup(format!(
-                "Failed to cleanup orphaned records: {e}"
-            )));
-        }
-
-        // Record scan completion time for getIndexes/getArtists lastModified
-        if let Err(e) = crate::db::SettingsRepository::new(self.pool.clone()).set(
+        self.cleanup_orphans()?;
+        crate::db::SettingsRepository::new(self.pool.clone()).set(
             crate::db::SETTING_LAST_SCAN_AT,
             &chrono::Utc::now().timestamp_millis().to_string(),
-        ) {
-            tracing::event!(
-                name: "scan.last_scan_write_failed",
-                tracing::Level::WARN,
-                error = %e,
-                "failed to record scan completion time"
-            );
-        }
-
-        Ok(total_result)
-    }
-
-    /// Scan a specific music folder by ID (full scan).
-    pub fn scan_folder_by_id(&self, folder_id: i32) -> Result<ScanResult, ScanError> {
-        self.scan_folder_by_id_with_mode(folder_id, ScanMode::Full)
-    }
-
-    /// Scan a specific music folder by ID with scan mode.
-    pub fn scan_folder_by_id_with_mode(
-        &self,
-        folder_id: i32,
-        mode: ScanMode,
-    ) -> Result<ScanResult, ScanError> {
-        self.scan_folder_by_id_with_state_and_mode(folder_id, None, mode)
-    }
-
-    /// Scan a specific music folder by ID with optional progress tracking and scan mode.
-    pub fn scan_folder_by_id_with_state_and_mode(
-        &self,
-        folder_id: i32,
-        state: Option<&ScanStateHandle>,
-        mode: ScanMode,
-    ) -> Result<ScanResult, ScanError> {
-        let folder_repo = MusicFolderRepository::new(self.pool.clone());
-        let folder = folder_repo
-            .find_by_id(folder_id)?
-            .ok_or_else(|| ScanError::FolderNotFound(folder_id.to_string()))?;
-
-        tracing::event!(
-            name: "scan.folder.started",
-            tracing::Level::INFO,
-            folder.name = %folder.name,
-            folder.path = %folder.path,
-            scan.mode = ?mode,
-            "scanning folder"
-        );
-        self.scan_folder_with_options(&folder, state, mode)
-    }
-
-    /// Scan a single music folder with optional progress tracking and scan mode.
-    fn scan_folder_with_options(
-        &self,
-        folder: &MusicFolder,
-        state: Option<&ScanStateHandle>,
-        mode: ScanMode,
-    ) -> Result<ScanResult, ScanError> {
-        let mut result = ScanResult::default();
-        let folder_path = Path::new(&folder.path);
-
-        if !folder_path.exists() {
-            return Err(ScanError::FolderNotFound(folder.path.clone()));
-        }
-
-        // Set discovery phase
-        if let Some(s) = state {
-            s.set_phase(ScanPhase::Discovering);
-        }
-
-        // Get existing songs in this folder for incremental scanning
-        let existing_songs = self.get_existing_songs(folder.id)?;
-
-        // Collect all audio files on disk
-        let (discovered_files, discovered_paths) = Self::discover_files_with_paths(folder_path);
-        result.tracks_found = discovered_files.len();
-
-        let (files_to_process, skipped_unchanged) =
-            Self::split_discovered_files_for_mode(discovered_files, &existing_songs, mode);
-
-        // Set total count now that we know how many files to process
-        if let Some(s) = state {
-            // Add to total (accumulates across folders)
-            let current_total = s.get_total();
-            s.set_total(current_total + result.tracks_found as u64);
-            if skipped_unchanged > 0 {
-                let current_count = s.get_count();
-                s.set_count(current_count + skipped_unchanged as u64);
-            }
-            s.set_phase(ScanPhase::Processing);
-        }
-
-        tracing::event!(
-            name: "scan.folder.discovered",
-            tracing::Level::INFO,
-            folder.name = %folder.name,
-            tracks.found = result.tracks_found,
-            tracks.skipped_unchanged = skipped_unchanged,
-            "discovered audio files"
-        );
-
-        // Read metadata in parallel for files that need processing.
-        let folder_path_str = folder.path.clone();
-        let tracks: Vec<ScannedTrack> = files_to_process
-            .par_iter()
-            .filter_map(
-                |file| match Self::read_track_metadata_static(file, &folder_path_str) {
-                    Ok(track) => Some(track),
-                    Err(e) => {
-                        tracing::event!(
-                            name: "scan.track.metadata_failed",
-                            tracing::Level::WARN,
-                            file.path = %file.path.display(),
-                            error = %e,
-                            "failed to read track metadata"
-                        );
-                        None
-                    }
-                },
-            )
-            .collect();
-
-        // Find deleted files (in database but not on disk)
-        let deleted_paths: Vec<_> = existing_songs
-            .keys()
-            .filter(|path| !discovered_paths.contains(*path))
-            .cloned()
-            .collect();
-
-        if !deleted_paths.is_empty() {
-            let dirty_album_ids: HashSet<i32> = deleted_paths
-                .iter()
-                .filter_map(|path| existing_songs.get(path).and_then(|song| song.album_id))
-                .collect();
-            tracing::event!(
-                name: "scan.folder.removing_deleted",
-                tracing::Level::INFO,
-                folder.name = %folder.name,
-                tracks.removed = deleted_paths.len(),
-                "removing deleted files from database"
-            );
-            result.tracks_removed = self.remove_deleted_songs(&deleted_paths)?;
-            self.update_album_stats_for_ids(&dirty_album_ids)?;
-        }
-
-        // Process tracks and populate database
-        let processed = self.process_tracks_with_options(
-            folder,
-            tracks,
-            &existing_songs,
-            state,
-            skipped_unchanged,
         )?;
+        Ok(result)
+    }
 
-        result.artists_added = processed.artists_added;
-        result.albums_added = processed.albums_added;
-        result.tracks_added = processed.tracks_added;
-        result.tracks_updated = processed.tracks_updated;
-        result.tracks_skipped = processed.tracks_skipped;
-        result.tracks_failed = processed.tracks_failed;
-        result.cover_art_saved = processed.cover_art_saved;
+    fn directory_path(root: &MusicFolder, relative: &Path) -> PathBuf {
+        if relative.as_os_str().is_empty() {
+            PathBuf::from(&root.path)
+        } else {
+            Path::new(&root.path).join(relative)
+        }
+    }
 
+    fn scan_tree(
+        &self,
+        root: &MusicFolder,
+        relative: &Path,
+        mode: ScanMode,
+        state: Option<&ScanStateHandle>,
+    ) -> Result<ScanResult, ScanError> {
+        let absolute = Self::directory_path(root, relative);
+        Self::validate_component(&absolute)?;
+        let listing = Self::discover_entries(&absolute)?;
+        let mut result = self.scan_directory(root, relative, &listing, mode, state)?;
+        for child in &listing.children {
+            let child_relative = child
+                .strip_prefix(&root.path)
+                .map_err(|error| ScanError::InvalidTarget(error.to_string()))?;
+            match self.scan_tree(root, child_relative, mode, state) {
+                Ok(scanned) => result += scanned,
+                Err(error @ (ScanError::Io(_) | ScanError::InvalidTarget(_))) => {
+                    tracing::warn!(path = %child.display(), %error, "scan directory failed; preserving indexed branch");
+                    result.tracks_failed += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if listing.complete {
+            let folders = MusicFolderRepository::new(self.pool.clone());
+            if let Some(folder) = folders.find(root.id, &relative.to_string_lossy())? {
+                for child in folders.children(folder.id)? {
+                    if !listing.entries.contains(Path::new(&child.path)) {
+                        result += self.remove_branch(&child)?;
+                    }
+                }
+            }
+        }
+        self.prune_directory(root, relative, &listing)?;
+        Ok(result)
+    }
+
+    fn prune_directory(
+        &self,
+        root: &MusicFolder,
+        relative: &Path,
+        listing: &DirectoryListing,
+    ) -> Result<(), ScanError> {
+        if listing.complete && listing.audio_paths.is_empty() {
+            let folders = MusicFolderRepository::new(self.pool.clone());
+            if let Some(folder) = folders.find(root.id, &relative.to_string_lossy())? {
+                folders.prune(folder.id)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn proven_absent(path: &Path) -> Result<bool, ScanError> {
+        let Some(parent) = path.parent() else {
+            return Ok(false);
+        };
+        let listing = Self::discover_entries(parent)?;
+        Ok(listing.complete && !listing.entries.contains(path))
+    }
+
+    fn remove_direct(&self, root: &MusicFolder, relative: &Path) -> Result<ScanResult, ScanError> {
+        let folders = MusicFolderRepository::new(self.pool.clone());
+        let Some(folder) = folders.find(root.id, &relative.to_string_lossy())? else {
+            return Ok(ScanResult::default());
+        };
+        let result = self.remove_owned(&folder)?;
+        folders.prune(folder.id)?;
+        Ok(result)
+    }
+
+    fn remove_branch(&self, folder: &MusicFolder) -> Result<ScanResult, ScanError> {
+        let folders = MusicFolderRepository::new(self.pool.clone());
+        let mut result = self.remove_owned(folder)?;
+        for child in folders.children(folder.id)? {
+            result += self.remove_branch(&child)?;
+        }
+        folders.prune(folder.id)?;
+        Ok(result)
+    }
+
+    fn remove_owned(&self, folder: &MusicFolder) -> Result<ScanResult, ScanError> {
+        let existing = self.get_existing_songs(folder.id)?;
+        let paths: Vec<_> = existing.keys().cloned().collect();
+        let albums = existing.values().filter_map(|song| song.album_id).collect();
+        tracing::debug!(name: "scan.directory.reconcile", owner = folder.id, path = %folder.path);
+        let removed = self.remove_deleted_songs(&paths)?;
+        self.update_album_stats_for_ids(&albums)?;
+        Ok(ScanResult {
+            tracks_removed: removed,
+            ..ScanResult::default()
+        })
+    }
+
+    fn scan_directory(
+        &self,
+        root: &MusicFolder,
+        relative: &Path,
+        listing: &DirectoryListing,
+        mode: ScanMode,
+        state: Option<&ScanStateHandle>,
+    ) -> Result<ScanResult, ScanError> {
+        let folders = MusicFolderRepository::new(self.pool.clone());
+        let relative = relative.to_string_lossy();
+        let folder = if listing.audio_paths.is_empty() {
+            folders.find(root.id, &relative)?
+        } else {
+            Some(folders.ensure(root.id, &relative)?)
+        };
+        let existing = match &folder {
+            Some(folder) => self.get_existing_songs(folder.id)?,
+            None => HashMap::new(),
+        };
+        let (files, skipped) =
+            Self::split_discovered_files_for_mode(&listing.files, &existing, mode);
+        if let Some(state) = state {
+            state.set_phase(ScanPhase::Processing);
+            state.set_total(state.get_total() + listing.audio_paths.len() as u64);
+            state.set_count(state.get_count() + skipped as u64);
+        }
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let tracks: Vec<_> = files.par_iter().filter_map(|file| {
+            tracing::dispatcher::with_default(&dispatch, || {
+                match Self::read_track_metadata_static(file) {
+                    Ok(track) => Some(track),
+                    Err(error) => { tracing::warn!(path = %file.path.display(), %error, "scan metadata read failed"); None }
+                }
+            })
+        }).collect();
+        let metadata_failures = files.len() - tracks.len();
+        let mut result = if let Some(folder) = &folder {
+            self.process_tracks_with_options(folder, tracks, &existing, state, skipped)?
+        } else {
+            ScanResult::default()
+        };
+        result.tracks_found = listing.audio_paths.len();
+        result.tracks_failed += listing.failures + metadata_failures;
+        if let Some(folder) = &folder {
+            tracing::debug!(name: "scan.directory.reconcile", owner = folder.id, path = %folder.path);
+            if listing.complete {
+                let deleted: Vec<_> = existing
+                    .keys()
+                    .filter(|path| !listing.audio_paths.contains(*path))
+                    .cloned()
+                    .collect();
+                let albums = deleted
+                    .iter()
+                    .filter_map(|path| existing.get(path).and_then(|song| song.album_id))
+                    .collect();
+                result.tracks_removed += self.remove_deleted_songs(&deleted)?;
+                self.update_album_stats_for_ids(&albums)?;
+            }
+        }
         Ok(result)
     }
 
@@ -422,13 +456,16 @@ impl Scanner {
                 songs::file_modified_at,
                 songs::file_size,
                 songs::album_id,
+                songs::music_folder_id,
             ))
-            .load(&mut conn)
+            .load::<(String, Option<i64>, i64, Option<i32>, i32)>(&mut conn)
             .map_err(MusicRepoError::from)?;
 
+        tracing::debug!(name: "scan.directory.read", owner = folder_id, count = existing.len());
         Ok(existing
             .into_iter()
-            .map(|(path, file_modified_at, file_size, album_id)| {
+            .map(|(path, file_modified_at, file_size, album_id, owner)| {
+                tracing::debug!(name: "scan.directory.member", owner = folder_id, returned_owner = owner);
                 (
                     path,
                     ExistingSong {
@@ -478,81 +515,97 @@ impl Scanner {
         Ok(())
     }
 
-    /// Discover all audio files in a directory, also returning the set of discovered paths.
-    fn discover_files_with_paths(folder_path: &Path) -> (Vec<DiscoveredFile>, HashSet<String>) {
-        // First, collect all audio file paths (fast, sequential walk)
-        let audio_files: Vec<PathBuf> = WalkDir::new(folder_path)
-            .follow_links(false)
-            .into_iter()
-            .filter_map(|entry| match entry {
-                Ok(entry) => Some(entry),
-                Err(error) => {
-                    tracing::warn!(error = %error, "Failed to walk scanner path");
-                    None
-                }
-            })
-            .filter(|entry| entry.path().is_file())
-            .filter_map(|entry| {
-                let path = entry.into_path();
-                let ext = path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .map(str::to_lowercase);
-
-                match ext {
-                    Some(ext) if AUDIO_EXTENSIONS.contains(&ext.as_str()) => Some(path),
-                    _ => None,
-                }
-            })
-            .collect();
-
-        // Build paths set
-        let paths: HashSet<String> = audio_files
-            .iter()
-            .map(|p| p.to_string_lossy().to_string())
-            .collect();
-
-        let discovered_files: Vec<DiscoveredFile> = audio_files
-            .into_iter()
-            .filter_map(|path| {
-                let metadata = match fs::metadata(&path) {
-                    Ok(metadata) => metadata,
-                    Err(e) => {
-                        tracing::event!(
-                            name: "scan.discovery.metadata_failed",
-                            tracing::Level::WARN,
-                            file.path = %path.display(),
-                            error = %e,
-                            "failed to read file metadata"
-                        );
-                        return None;
+    /// List one directory; incomplete listings never prove absence.
+    fn discover_entries(path: &Path) -> Result<DirectoryListing, std::io::Error> {
+        tracing::debug!(name: "scan.directory.enumerate", path = %path.display());
+        let entries = fs::read_dir(path)?;
+        let mut listing = DirectoryListing {
+            complete: true,
+            ..DirectoryListing::default()
+        };
+        for entry in entries {
+            match entry {
+                Ok(entry) => {
+                    let path = entry.path();
+                    listing.entries.insert(path.clone());
+                    if let Err(error) = Self::classify_entry(&path, &mut listing) {
+                        listing.complete = false;
+                        listing.failures += 1;
+                        tracing::warn!(path = %path.display(), %error, "scan entry classification failed");
                     }
-                };
-
-                let file_modified_at = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
-
-                Some(DiscoveredFile {
-                    path,
-                    file_size: metadata.len(),
-                    file_modified_at,
-                })
-            })
-            .collect();
-
-        (discovered_files, paths)
+                }
+                Err(error) => {
+                    listing.complete = false;
+                    listing.failures += 1;
+                    tracing::warn!(path = %path.display(), %error, "scan directory listing failed");
+                }
+            }
+        }
+        Ok(listing)
     }
 
-    fn split_discovered_files_for_mode(
-        discovered_files: Vec<DiscoveredFile>,
+    fn classify_entry(path: &Path, listing: &mut DirectoryListing) -> Result<(), std::io::Error> {
+        tracing::debug!(name: "scan.entry.classify", path = %path.display());
+        let metadata = fs::symlink_metadata(path)?;
+        if metadata.is_dir() {
+            listing.children.push(path.to_path_buf());
+            return Ok(());
+        }
+        if !path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| {
+                AUDIO_EXTENSIONS
+                    .iter()
+                    .any(|supported| ext.eq_ignore_ascii_case(supported))
+            })
+        {
+            return Ok(());
+        }
+        if metadata.is_symlink() && fs::metadata(path)?.is_dir() {
+            return Ok(());
+        }
+        if !metadata.is_file() && !metadata.is_symlink() {
+            return Ok(());
+        }
+        listing
+            .audio_paths
+            .insert(path.to_string_lossy().into_owned());
+        tracing::debug!(name: "scan.track.stat", path = %path.display());
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                listing.failures += 1;
+                tracing::warn!(path = %path.display(), %error, "scan file stat failed");
+                return Ok(());
+            }
+        };
+        let file_modified_at = match metadata.modified() {
+            Ok(time) => time
+                .duration_since(UNIX_EPOCH)
+                .ok()
+                .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)),
+            Err(error) => {
+                listing.failures += 1;
+                tracing::warn!(path = %path.display(), %error, "scan file modification time failed");
+                None
+            }
+        };
+        listing.files.push(DiscoveredFile {
+            path: path.to_path_buf(),
+            file_size: metadata.len(),
+            file_modified_at,
+        });
+        Ok(())
+    }
+
+    fn split_discovered_files_for_mode<'a>(
+        discovered_files: &'a [DiscoveredFile],
         existing_songs: &HashMap<String, ExistingSong>,
         mode: ScanMode,
-    ) -> (Vec<DiscoveredFile>, usize) {
+    ) -> (Vec<&'a DiscoveredFile>, usize) {
         if mode == ScanMode::Full {
-            return (discovered_files, 0);
+            return (discovered_files.iter().collect(), 0);
         }
 
         let mut to_process = Vec::with_capacity(discovered_files.len());
@@ -578,22 +631,17 @@ impl Scanner {
     }
 
     /// Static version of `read_track_metadata` for use with rayon (no &self needed).
-    fn read_track_metadata_static(
-        file: &DiscoveredFile,
-        folder_path: &str,
-    ) -> Result<ScannedTrack, ScanError> {
+    fn read_track_metadata_static(file: &DiscoveredFile) -> Result<ScannedTrack, ScanError> {
         let path = &file.path;
+        tracing::debug!(name: "scan.track.open", path = %path.display());
         let extension = path
             .extension()
             .and_then(|e| e.to_str())
             .map(str::to_lowercase)
             .unwrap_or_default();
 
-        // Get parent path relative to music folder
-        let parent_path = path
-            .parent()
-            .map(|p| p.strip_prefix(folder_path).unwrap_or(p).to_path_buf())
-            .unwrap_or_default();
+        // Persist the absolute containing directory.
+        let parent_path = path.parent().map(Path::to_path_buf).unwrap_or_default();
 
         // Read audio tags
         let tagged_file = lofty::read_from_path(path).map_err(|error| ScanError::Metadata {
@@ -707,6 +755,13 @@ impl Scanner {
     ) -> Result<ScanResult, ScanError> {
         use crate::db::schema::{albums, artists, songs};
         use diesel::prelude::*;
+
+        if tracks.is_empty() {
+            return Ok(ScanResult {
+                tracks_skipped: initial_tracks_skipped,
+                ..ScanResult::default()
+            });
+        }
 
         // Ensure cover art directory exists
         self.ensure_cover_art_dir()?;
@@ -1055,6 +1110,12 @@ impl Scanner {
                 } else {
                     result.tracks_added += 1;
                 }
+                if let Some(album_id) = existing_songs
+                    .get(&prepared.path_str)
+                    .and_then(|song| song.album_id)
+                {
+                    dirty_album_ids.insert(album_id);
+                }
                 if let Some(album_id) = prepared.album_id {
                     dirty_album_ids.insert(album_id);
                 }
@@ -1065,44 +1126,17 @@ impl Scanner {
         }
 
         // Update album song counts and durations for dirty albums only
-        Self::update_album_stats(&mut conn, &dirty_album_ids)?;
+        crate::db::repo::music::reconcile_albums(&mut conn, &dirty_album_ids)
+            .map_err(MusicRepoError::from)?;
 
         Ok(result)
     }
 
-    /// Update album statistics (song count, duration) for dirty albums only.
-    fn update_album_stats(
-        conn: &mut diesel::SqliteConnection,
-        dirty_album_ids: &std::collections::HashSet<i32>,
-    ) -> Result<(), ScanError> {
-        use diesel::prelude::*;
-
-        if dirty_album_ids.is_empty() {
-            return Ok(());
-        }
-
-        let id_list: Vec<String> = dirty_album_ids.iter().map(i32::to_string).collect();
-        let ids = id_list.join(",");
-        let sql = format!(
-            "
-            UPDATE albums SET
-                song_count = (SELECT COUNT(*) FROM songs WHERE songs.album_id = albums.id),
-                duration = (SELECT COALESCE(SUM(duration), 0) FROM songs WHERE songs.album_id = albums.id),
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id IN ({ids})
-            "
-        );
-
-        diesel::sql_query(sql)
-            .execute(conn)
-            .map_err(MusicRepoError::from)?;
-
-        Ok(())
-    }
-
     fn update_album_stats_for_ids(&self, dirty_album_ids: &HashSet<i32>) -> Result<(), ScanError> {
         let mut conn = self.pool.get().map_err(MusicRepoError::from)?;
-        Self::update_album_stats(&mut conn, dirty_album_ids)
+        crate::db::repo::music::reconcile_albums(&mut conn, dirty_album_ids)
+            .map_err(MusicRepoError::from)?;
+        Ok(())
     }
 }
 
@@ -1206,7 +1240,11 @@ impl AutoScanner {
                     "auto-scan cycle started"
                 );
                 scanner
-                    .scan_all_with_options(Some(&scan_state_clone), ScanMode::Incremental)
+                    .scan(
+                        ScanTarget::AllEnabled,
+                        ScanMode::Incremental,
+                        Some(&scan_state_clone),
+                    )
                     .map(AutoScanOutcome::Completed)
             })
             .await;
@@ -1315,7 +1353,7 @@ mod tests {
         ]);
 
         let (to_process, skipped) = Scanner::split_discovered_files_for_mode(
-            discovered_files,
+            &discovered_files,
             &existing,
             ScanMode::Incremental,
         );
@@ -1351,7 +1389,7 @@ mod tests {
         )]);
 
         let (to_process, skipped) =
-            Scanner::split_discovered_files_for_mode(discovered_files, &existing, ScanMode::Full);
+            Scanner::split_discovered_files_for_mode(&discovered_files, &existing, ScanMode::Full);
 
         assert_eq!(skipped, 0);
         assert_eq!(to_process.len(), 2);

@@ -100,6 +100,8 @@ impl From<diesel::r2d2::PoolError> for UserRepoError {
 /// Error kind for music repository operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MusicRepoErrorKind {
+    /// Invalid path or ownership assignment.
+    InvalidInput,
     /// Database query failed.
     Database,
     /// Connection pool error.
@@ -113,6 +115,7 @@ pub enum MusicRepoErrorKind {
 impl fmt::Display for MusicRepoErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidInput => write!(f, "invalid input"),
             Self::Database => write!(f, "database error"),
             Self::Pool => write!(f, "connection pool error"),
             Self::NotFound => write!(f, "not found"),

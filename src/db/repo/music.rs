@@ -20,6 +20,7 @@ pub struct MusicFolderRow {
     pub id: i32,
     pub name: String,
     pub path: String,
+    pub parent: Option<i32>,
     pub enabled: bool,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
@@ -31,28 +32,10 @@ impl From<MusicFolderRow> for MusicFolder {
             id: row.id,
             name: row.name,
             path: row.path,
+            parent: row.parent,
             enabled: row.enabled,
             created_at: row.created_at,
             updated_at: row.updated_at,
-        }
-    }
-}
-
-/// Data for inserting a new music folder.
-#[derive(Debug, Clone, Insertable)]
-#[diesel(table_name = music_folders)]
-pub struct NewMusicFolderRow<'a> {
-    pub name: &'a str,
-    pub path: &'a str,
-    pub enabled: bool,
-}
-
-impl<'a> From<&'a NewMusicFolder> for NewMusicFolderRow<'a> {
-    fn from(folder: &'a NewMusicFolder) -> Self {
-        Self {
-            name: &folder.name,
-            path: &folder.path,
-            enabled: folder.enabled,
         }
     }
 }
@@ -75,6 +58,7 @@ impl MusicFolderRepository {
         let mut conn = self.pool.get()?;
 
         let results = music_folders::table
+            .filter(music_folders::parent.is_null())
             .select(MusicFolderRow::as_select())
             .order(music_folders::name.asc())
             .load(&mut conn)?;
@@ -87,6 +71,7 @@ impl MusicFolderRepository {
         let mut conn = self.pool.get()?;
 
         let results = music_folders::table
+            .filter(music_folders::parent.is_null())
             .filter(music_folders::enabled.eq(true))
             .select(MusicFolderRow::as_select())
             .order(music_folders::name.asc())
@@ -125,50 +110,80 @@ impl MusicFolderRepository {
     pub fn create(&self, new_folder: &NewMusicFolder) -> Result<MusicFolder, MusicRepoError> {
         let mut conn = self.pool.get()?;
 
-        // Check if path already exists
-        let existing = music_folders::table
-            .filter(music_folders::path.eq(&new_folder.path))
-            .count()
-            .get_result::<i64>(&mut conn)?;
-
-        if existing > 0 {
+        let canonical = std::fs::canonicalize(&new_folder.path).map_err(|error| {
+            MusicRepoError::with_source(MusicRepoErrorKind::InvalidInput, &new_folder.path, error)
+        })?;
+        if !canonical.is_dir() {
             return Err(MusicRepoError::new(
-                MusicRepoErrorKind::AlreadyExists,
-                new_folder.path.clone(),
+                MusicRepoErrorKind::InvalidInput,
+                "root must be a directory",
             ));
         }
-
-        let row: NewMusicFolderRow = new_folder.into();
-        diesel::insert_into(music_folders::table)
-            .values(&row)
-            .execute(&mut conn)?;
-
-        // Fetch the created folder
-        let folder = music_folders::table
-            .filter(music_folders::path.eq(&new_folder.path))
-            .select(MusicFolderRow::as_select())
-            .first(&mut conn)?;
-
-        Ok(MusicFolder::from(folder))
+        let path = canonical.to_str().ok_or_else(|| {
+            MusicRepoError::new(MusicRepoErrorKind::InvalidInput, "root path is not UTF-8")
+        })?;
+        conn.transaction(|conn| {
+            let roots = music_folders::table
+                .filter(music_folders::parent.is_null())
+                .select(music_folders::path)
+                .load::<String>(conn)?;
+            if roots.iter().any(|root| {
+                canonical.starts_with(root) || std::path::Path::new(root).starts_with(&canonical)
+            }) {
+                return Err(MusicRepoError::new(
+                    MusicRepoErrorKind::AlreadyExists,
+                    "registered roots overlap",
+                ));
+            }
+            diesel::insert_into(music_folders::table)
+                .values((
+                    music_folders::name.eq(&new_folder.name),
+                    music_folders::path.eq(path),
+                    music_folders::enabled.eq(new_folder.enabled),
+                ))
+                .execute(conn)?;
+            let folder = music_folders::table
+                .filter(music_folders::path.eq(path))
+                .select(MusicFolderRow::as_select())
+                .first::<MusicFolderRow>(conn)?;
+            Ok(folder.into())
+        })
     }
 
-    /// Delete a music folder by ID.
+    /// Remove a registered root, its descendants, and their indexed songs.
     pub fn delete(&self, folder_id: i32) -> Result<bool, MusicRepoError> {
         let mut conn = self.pool.get()?;
-
-        let deleted = diesel::delete(music_folders::table.filter(music_folders::id.eq(folder_id)))
-            .execute(&mut conn)?;
-
-        Ok(deleted > 0)
+        conn.transaction(|conn| {
+            let ids = subtree_ids(conn, folder_id)?;
+            if ids.is_empty() {
+                return Ok(false);
+            }
+            let albums = songs::table
+                .filter(songs::music_folder_id.eq_any(&ids))
+                .select(songs::album_id)
+                .load::<Option<i32>>(conn)?
+                .into_iter()
+                .flatten()
+                .collect();
+            diesel::delete(songs::table.filter(songs::music_folder_id.eq_any(&ids)))
+                .execute(conn)?;
+            diesel::delete(music_folders::table.find(folder_id)).execute(conn)?;
+            reconcile_albums(conn, &albums)?;
+            Ok(true)
+        })
     }
 
     /// Enable or disable a music folder.
     pub fn set_enabled(&self, folder_id: i32, enabled: bool) -> Result<bool, MusicRepoError> {
         let mut conn = self.pool.get()?;
 
-        let updated = diesel::update(music_folders::table.filter(music_folders::id.eq(folder_id)))
-            .set(music_folders::enabled.eq(enabled))
-            .execute(&mut conn)?;
+        let updated = diesel::update(
+            music_folders::table
+                .filter(music_folders::id.eq(folder_id))
+                .filter(music_folders::parent.is_null()),
+        )
+        .set(music_folders::enabled.eq(enabled))
+        .execute(&mut conn)?;
 
         Ok(updated > 0)
     }
@@ -177,6 +192,166 @@ impl MusicFolderRepository {
 // ============================================================================
 // Artist Repository
 // ============================================================================
+
+/// Normalize a directory selector without allowing it to escape its root.
+pub fn normalize_directory_path(path: &std::path::Path) -> Result<String, MusicRepoError> {
+    use std::path::Component;
+    let mut normalized = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(name) => normalized.push(name),
+            Component::CurDir => {}
+            _ => {
+                return Err(MusicRepoError::new(
+                    MusicRepoErrorKind::InvalidInput,
+                    "directory must be root-relative and contain no '..'",
+                ));
+            }
+        }
+    }
+    normalized.to_str().map(str::to_owned).ok_or_else(|| {
+        MusicRepoError::new(
+            MusicRepoErrorKind::InvalidInput,
+            "directory path is not UTF-8",
+        )
+    })
+}
+
+/// Insert containing folders and ancestors relative to a registered root.
+pub(crate) fn ensure_directory(
+    conn: &mut SqliteConnection,
+    root_id: i32,
+    path: &str,
+) -> Result<MusicFolder, diesel::result::Error> {
+    let mut folder = music_folders::table
+        .find(root_id)
+        .filter(music_folders::parent.is_null())
+        .select(MusicFolderRow::as_select())
+        .first::<MusicFolderRow>(conn)?;
+    for component in std::path::Path::new(path).components() {
+        let absolute = std::path::Path::new(&folder.path).join(component);
+        let absolute = absolute.to_string_lossy();
+        let name = component.as_os_str().to_string_lossy();
+        diesel::insert_into(music_folders::table)
+            .values((
+                music_folders::path.eq(absolute.as_ref()),
+                music_folders::name.eq(name.as_ref()),
+                music_folders::parent.eq(folder.id),
+            ))
+            .on_conflict(music_folders::path)
+            .do_nothing()
+            .execute(conn)?;
+        folder = music_folders::table
+            .filter(music_folders::path.eq(absolute.as_ref()))
+            .select(MusicFolderRow::as_select())
+            .first(conn)?;
+    }
+    Ok(folder.into())
+}
+
+#[derive(QueryableByName)]
+struct FolderId {
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    id: i32,
+}
+
+/// Refresh affected albums from all persisted members, including disabled roots.
+pub(crate) fn reconcile_albums(
+    conn: &mut diesel::SqliteConnection,
+    dirty_album_ids: &std::collections::HashSet<i32>,
+) -> Result<(), diesel::result::Error> {
+    use diesel::prelude::*;
+
+    if dirty_album_ids.is_empty() {
+        return Ok(());
+    }
+
+    let id_list: Vec<String> = dirty_album_ids.iter().map(i32::to_string).collect();
+    let ids = id_list.join(",");
+    let sql = format!(
+            "
+            UPDATE albums SET
+                song_count = (SELECT COUNT(*) FROM songs WHERE songs.album_id = albums.id),
+                duration = (SELECT COALESCE(SUM(duration), 0) FROM songs WHERE songs.album_id = albums.id),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id IN ({ids})
+            "
+        );
+
+    diesel::sql_query(sql).execute(conn)?;
+
+    diesel::sql_query(format!("DELETE FROM albums WHERE id IN ({ids}) AND NOT EXISTS (SELECT 1 FROM songs WHERE album_id = albums.id)")).execute(conn)?;
+    Ok(())
+}
+
+/// IDs in a folder subtree; public filters must start at a registered root.
+pub(crate) fn subtree_ids(
+    conn: &mut SqliteConnection,
+    folder_id: i32,
+) -> Result<Vec<i32>, diesel::result::Error> {
+    let query = "WITH RECURSIVE tree(id) AS (SELECT id FROM music_folders WHERE id = ? AND parent IS NULL UNION ALL SELECT f.id FROM music_folders f JOIN tree t ON f.parent = t.id) SELECT id FROM tree";
+    Ok(diesel::sql_query(query)
+        .bind::<diesel::sql_types::Integer, _>(folder_id)
+        .load::<FolderId>(conn)?
+        .into_iter()
+        .map(|row| row.id)
+        .collect())
+}
+
+impl MusicFolderRepository {
+    pub fn ensure(&self, root_id: i32, path: &str) -> Result<MusicFolder, MusicRepoError> {
+        let path = normalize_directory_path(std::path::Path::new(path))?;
+        let mut conn = self.pool.get()?;
+        Ok(conn.transaction(|conn| ensure_directory(conn, root_id, &path))?)
+    }
+
+    pub fn find(&self, root_id: i32, path: &str) -> Result<Option<MusicFolder>, MusicRepoError> {
+        let path = normalize_directory_path(std::path::Path::new(path))?;
+        let Some(root) = self
+            .find_by_id(root_id)?
+            .filter(|root| root.parent.is_none())
+        else {
+            return Ok(None);
+        };
+        if path.is_empty() {
+            return Ok(Some(root));
+        }
+        let absolute = std::path::Path::new(&root.path).join(path);
+        self.find_by_path(&absolute.to_string_lossy())
+    }
+
+    pub fn find_by_root(&self, root_id: i32) -> Result<Vec<MusicFolder>, MusicRepoError> {
+        let mut conn = self.pool.get()?;
+        let ids = subtree_ids(&mut conn, root_id)?;
+        Ok(music_folders::table
+            .filter(music_folders::id.eq_any(ids))
+            .order(music_folders::path.asc())
+            .select(MusicFolderRow::as_select())
+            .load::<MusicFolderRow>(&mut conn)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    pub fn children(&self, folder_id: i32) -> Result<Vec<MusicFolder>, MusicRepoError> {
+        let mut conn = self.pool.get()?;
+        Ok(music_folders::table
+            .filter(music_folders::parent.eq(folder_id))
+            .select(MusicFolderRow::as_select())
+            .load::<MusicFolderRow>(&mut conn)?
+            .into_iter()
+            .map(Into::into)
+            .collect())
+    }
+
+    /// Remove a confirmed empty leaf; recursive discovery prunes ancestors afterwards.
+    pub fn prune(&self, folder_id: i32) -> Result<(), MusicRepoError> {
+        let mut conn = self.pool.get()?;
+        diesel::sql_query("DELETE FROM music_folders WHERE id = ? AND parent IS NOT NULL AND NOT EXISTS (SELECT 1 FROM songs WHERE music_folder_id = music_folders.id) AND id NOT IN (SELECT parent FROM music_folders WHERE parent IS NOT NULL)")
+            .bind::<diesel::sql_types::Integer, _>(folder_id).execute(&mut conn)?;
+        Ok(())
+    }
+}
 
 /// Database row representation for artists.
 #[derive(Debug, Clone, Queryable, Selectable)]
@@ -239,7 +414,7 @@ impl ArtistRepository {
 
         let results = artists::table
             .inner_join(songs::table.on(songs::artist_id.eq(artists::id.nullable())))
-            .filter(songs::music_folder_id.eq(folder_id))
+            .filter(songs::music_folder_id.eq_any(subtree_ids(&mut conn, folder_id)?))
             .select(ArtistRow::as_select())
             .distinct()
             .order(artists::name.asc())
@@ -364,7 +539,7 @@ impl ArtistRepository {
         if let Some(folder_id) = music_folder_id {
             db_query = db_query.filter(diesel::dsl::exists(
                 songs::table
-                    .filter(songs::music_folder_id.eq(folder_id))
+                    .filter(songs::music_folder_id.eq_any(subtree_ids(&mut conn, folder_id)?))
                     .filter(songs::artist_id.eq(artists::id.nullable())),
             ));
         }
@@ -426,6 +601,25 @@ impl From<AlbumRow> for Album {
     }
 }
 
+/// Apply root membership before list ordering and pagination.
+pub(crate) fn album_query(
+    conn: &mut SqliteConnection,
+    root: Option<i32>,
+) -> Result<albums::BoxedQuery<'static, diesel::sqlite::Sqlite>, diesel::result::Error> {
+    let mut query = albums::table.into_boxed();
+    if let Some(root) = root {
+        let ids = subtree_ids(conn, root)?;
+        query = query.filter(
+            albums::id.nullable().eq_any(
+                songs::table
+                    .filter(songs::music_folder_id.eq_any(ids))
+                    .select(songs::album_id),
+            ),
+        );
+    }
+    Ok(query)
+}
+
 /// Repository for album database operations.
 #[derive(Clone, Debug)]
 pub struct AlbumRepository {
@@ -482,10 +676,11 @@ impl AlbumRepository {
         &self,
         offset: i64,
         limit: i64,
+        music_folder_id: Option<i32>,
     ) -> Result<Vec<Album>, MusicRepoError> {
         let mut conn = self.pool.get()?;
 
-        let results = albums::table
+        let results = album_query(&mut conn, music_folder_id)?
             .select(AlbumRow::as_select())
             .order(albums::name.asc())
             .offset(offset)
@@ -500,10 +695,11 @@ impl AlbumRepository {
         &self,
         offset: i64,
         limit: i64,
+        music_folder_id: Option<i32>,
     ) -> Result<Vec<Album>, MusicRepoError> {
         let mut conn = self.pool.get()?;
 
-        let results = albums::table
+        let results = album_query(&mut conn, music_folder_id)?
             .select(AlbumRow::as_select())
             .order((albums::artist_name.asc(), albums::name.asc()))
             .offset(offset)
@@ -514,10 +710,15 @@ impl AlbumRepository {
     }
 
     /// Find newest albums (by `created_at`) with pagination.
-    pub fn find_newest(&self, offset: i64, limit: i64) -> Result<Vec<Album>, MusicRepoError> {
+    pub fn find_newest(
+        &self,
+        offset: i64,
+        limit: i64,
+        music_folder_id: Option<i32>,
+    ) -> Result<Vec<Album>, MusicRepoError> {
         let mut conn = self.pool.get()?;
 
-        let results = albums::table
+        let results = album_query(&mut conn, music_folder_id)?
             .select(AlbumRow::as_select())
             .order(albums::created_at.desc())
             .offset(offset)
@@ -528,10 +729,15 @@ impl AlbumRepository {
     }
 
     /// Find most frequently played albums with pagination.
-    pub fn find_frequent(&self, offset: i64, limit: i64) -> Result<Vec<Album>, MusicRepoError> {
+    pub fn find_frequent(
+        &self,
+        offset: i64,
+        limit: i64,
+        music_folder_id: Option<i32>,
+    ) -> Result<Vec<Album>, MusicRepoError> {
         let mut conn = self.pool.get()?;
 
-        let results = albums::table
+        let results = album_query(&mut conn, music_folder_id)?
             .select(AlbumRow::as_select())
             .order(albums::play_count.desc())
             .offset(offset)
@@ -543,10 +749,15 @@ impl AlbumRepository {
 
     /// Find recently played albums with pagination.
     /// Note: Using `updated_at` as a proxy for last played time.
-    pub fn find_recent(&self, offset: i64, limit: i64) -> Result<Vec<Album>, MusicRepoError> {
+    pub fn find_recent(
+        &self,
+        offset: i64,
+        limit: i64,
+        music_folder_id: Option<i32>,
+    ) -> Result<Vec<Album>, MusicRepoError> {
         let mut conn = self.pool.get()?;
 
-        let results = albums::table
+        let results = album_query(&mut conn, music_folder_id)?
             .filter(albums::play_count.gt(0))
             .select(AlbumRow::as_select())
             .order(albums::updated_at.desc())
@@ -558,11 +769,15 @@ impl AlbumRepository {
     }
 
     /// Find random albums.
-    pub fn find_random(&self, limit: i64) -> Result<Vec<Album>, MusicRepoError> {
+    pub fn find_random(
+        &self,
+        limit: i64,
+        music_folder_id: Option<i32>,
+    ) -> Result<Vec<Album>, MusicRepoError> {
         let mut conn = self.pool.get()?;
 
         // SQLite uses RANDOM() for random ordering
-        let results = albums::table
+        let results = album_query(&mut conn, music_folder_id)?
             .select(AlbumRow::as_select())
             .order(diesel::dsl::sql::<diesel::sql_types::Integer>("RANDOM()"))
             .limit(limit)
@@ -578,10 +793,11 @@ impl AlbumRepository {
         to_year: i32,
         offset: i64,
         limit: i64,
+        music_folder_id: Option<i32>,
     ) -> Result<Vec<Album>, MusicRepoError> {
         let mut conn = self.pool.get()?;
 
-        let results = albums::table
+        let results = album_query(&mut conn, music_folder_id)?
             .filter(albums::year.ge(from_year))
             .filter(albums::year.le(to_year))
             .select(AlbumRow::as_select())
@@ -599,10 +815,11 @@ impl AlbumRepository {
         genre: &str,
         offset: i64,
         limit: i64,
+        music_folder_id: Option<i32>,
     ) -> Result<Vec<Album>, MusicRepoError> {
         let mut conn = self.pool.get()?;
 
-        let results = albums::table
+        let results = album_query(&mut conn, music_folder_id)?
             .filter(albums::genre.eq(genre))
             .select(AlbumRow::as_select())
             .order(albums::name.asc())
@@ -640,7 +857,7 @@ impl AlbumRepository {
         if let Some(folder_id) = music_folder_id {
             db_query = db_query.filter(diesel::dsl::exists(
                 songs::table
-                    .filter(songs::music_folder_id.eq(folder_id))
+                    .filter(songs::music_folder_id.eq_any(subtree_ids(&mut conn, folder_id)?))
                     .filter(songs::album_id.eq(albums::id.nullable())),
             ));
         }
@@ -741,6 +958,16 @@ pub struct SongRepository {
 }
 
 impl SongRepository {
+    /// Read only the songs directly owned by one directory.
+    pub fn find_by_directory(&self, directory_id: i32) -> Result<Vec<Song>, MusicRepoError> {
+        let mut conn = self.pool.get()?;
+        let rows = songs::table
+            .filter(songs::music_folder_id.eq(directory_id))
+            .select(SongRow::as_select())
+            .load(&mut conn)?;
+        Ok(rows.into_iter().map(Song::from).collect())
+    }
+
     /// Create a new song repository.
     #[must_use]
     pub const fn new(pool: DbPool) -> Self {
@@ -791,7 +1018,7 @@ impl SongRepository {
         let mut conn = self.pool.get()?;
 
         let results = songs::table
-            .filter(songs::music_folder_id.eq(folder_id))
+            .filter(songs::music_folder_id.eq_any(subtree_ids(&mut conn, folder_id)?))
             .select(SongRow::as_select())
             .order(songs::path.asc())
             .load(&mut conn)?;
@@ -823,7 +1050,8 @@ impl SongRepository {
         }
 
         if let Some(folder_id) = music_folder_id {
-            db_query = db_query.filter(songs::music_folder_id.eq(folder_id));
+            db_query =
+                db_query.filter(songs::music_folder_id.eq_any(subtree_ids(&mut conn, folder_id)?));
         }
 
         let results = db_query.load(&mut conn)?;
@@ -901,7 +1129,7 @@ impl SongRepository {
         }
 
         if let Some(folder_id) = music_folder_id {
-            query = query.filter(songs::music_folder_id.eq(folder_id));
+            query = query.filter(songs::music_folder_id.eq_any(subtree_ids(&mut conn, folder_id)?));
         }
 
         let results = query
@@ -928,7 +1156,7 @@ impl SongRepository {
         query = query.filter(songs::genre.eq(genre));
 
         if let Some(folder_id) = music_folder_id {
-            query = query.filter(songs::music_folder_id.eq(folder_id));
+            query = query.filter(songs::music_folder_id.eq_any(subtree_ids(&mut conn, folder_id)?));
         }
 
         let results = query
@@ -1016,7 +1244,7 @@ impl SongRepository {
 mod search_tests {
     use super::{AlbumRepository, ArtistRepository, SongRepository};
     use crate::db::schema::{albums, artists, music_folders, songs};
-    use crate::db::{DbConfig, DbPool, run_migrations};
+    use crate::db::{DbConfig, DbPool, initialize_database};
     use crate::models::music::normalize_search_text;
     use diesel::prelude::*;
 
@@ -1027,8 +1255,8 @@ mod search_tests {
             ..DbConfig::default()
         };
         let pool = config.build_pool().expect("pool must build");
-        run_migrations(&mut pool.get().expect("connection must checkout"))
-            .expect("migrations must run");
+        initialize_database(&mut pool.get().expect("connection must checkout"))
+            .expect("schema must initialize");
         pool
     }
 

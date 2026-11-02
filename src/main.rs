@@ -19,12 +19,14 @@ use suboxide::crypto::{PasswordError, hash_password};
 use suboxide::db::{
     DbConfig, DbPool, MusicFolderRepository, MusicRepoError, NewUser, SETTING_LASTFM_API_KEY,
     SETTING_LASTFM_API_SECRET, SettingsRepository, UserRepoError, UserRepository, UserUpdate,
-    run_migrations,
+    initialize_database,
 };
 use suboxide::lastfm::{LastFmClient, LastFmError};
 use suboxide::models::music::NewMusicFolder;
 use suboxide::scanner::state::ScanSnapshot;
-use suboxide::scanner::{AutoScanner, ScanError, ScanMode, ScanState, ScanStateHandle, Scanner};
+use suboxide::scanner::{
+    AutoScanner, ScanError, ScanMode, ScanState, ScanStateHandle, ScanTarget, Scanner,
+};
 
 /// Subsonic-compatible music streaming server.
 #[derive(Parser)]
@@ -66,6 +68,10 @@ enum Commands {
         /// Specific folder ID to scan (scans all if not specified)
         #[arg(short, long)]
         folder: Option<i32>,
+
+        /// Update only the direct entries of a root-relative directory
+        #[arg(long, requires = "folder")]
+        directory: Option<PathBuf>,
 
         /// Run full scan (re-scan all files regardless of modification time)
         #[arg(long)]
@@ -238,8 +244,8 @@ enum SetupError {
     Connection(#[source] Box<dyn std::error::Error + Send + Sync>),
     #[error("Invalid database path")]
     InvalidPath,
-    #[error("Failed to run migrations: {0}")]
-    Migration(#[source] diesel::result::Error),
+    #[error("Failed to initialize database: {0}")]
+    Initialization(#[source] diesel::result::Error),
 }
 
 fn setup_database(database_path: impl AsRef<std::path::Path>) -> Result<DbPool, SetupError> {
@@ -253,7 +259,7 @@ fn setup_database(database_path: impl AsRef<std::path::Path>) -> Result<DbPool, 
     let mut conn = pool
         .get()
         .map_err(|e| SetupError::Connection(Box::new(e)))?;
-    run_migrations(&mut conn).map_err(SetupError::Migration)?;
+    initialize_database(&mut conn).map_err(SetupError::Initialization)?;
 
     Ok(pool)
 }
@@ -634,24 +640,34 @@ async fn run_lastfm_command(pool: &DbPool, cmd: LastfmCommands) -> Result<(), La
     Ok(())
 }
 
-fn run_scan_command(pool: &DbPool, folder: Option<i32>, full: bool) -> Result<(), ScanError> {
+fn run_scan_command(
+    pool: &DbPool,
+    folder: Option<i32>,
+    directory: Option<PathBuf>,
+    full: bool,
+) -> Result<(), ScanError> {
     let scanner = Scanner::new(pool.clone());
     let mode = if full {
         ScanMode::Full
     } else {
         ScanMode::Incremental
     };
+    let target = scanner.resolve_target(match (folder, directory) {
+        (Some(root_id), Some(path)) => ScanTarget::Directory { root_id, path },
+        (Some(root_id), None) => ScanTarget::Root(root_id),
+        (None, None) => ScanTarget::AllEnabled,
+        (None, Some(_)) => {
+            return Err(ScanError::InvalidTarget(
+                "--directory requires --folder".into(),
+            ));
+        }
+    })?;
     let scan_state = ScanStateHandle::new(ScanState::new());
     let progress = CliScanProgress::start(scan_state.clone());
 
     let result = {
         let _guard = scan_state.try_start().expect("new scan state should start");
-        folder.map_or_else(
-            || scanner.scan_all_with_options(Some(&scan_state), mode),
-            |folder_id| {
-                scanner.scan_folder_by_id_with_state_and_mode(folder_id, Some(&scan_state), mode)
-            },
-        )
+        scanner.scan(target, mode, Some(&scan_state))
     };
     progress.finish();
 
@@ -763,12 +779,18 @@ const fn spinner_frame(count: u64) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::time::Duration;
 
     use suboxide::scanner::ScanPhase;
     use suboxide::scanner::state::ScanSnapshot;
 
-    use super::{format_elapsed, format_scan_progress, progress_bar, spinner_frame};
+    use super::{
+        Cli, Commands, DbConfig, FolderCommandError, FolderCommands, ScanError, format_elapsed,
+        format_scan_progress, initialize_database, progress_bar, run_folder_command,
+        run_scan_command, spinner_frame,
+    };
+    use clap::Parser;
 
     #[test]
     fn progress_bar_fills_proportionally_and_clamps_overflow() {
@@ -814,6 +836,66 @@ mod tests {
         assert!(rendered.contains(" 50%"));
         assert!(rendered.contains("elapsed 01:05"));
         assert!(rendered.contains("processing Library"));
+    }
+    #[test]
+    fn scan_directory_requires_folder() {
+        assert!(Cli::try_parse_from(["suboxide", "scan", "--directory", "A"]).is_err());
+        let cli = Cli::try_parse_from([
+            "suboxide",
+            "scan",
+            "--folder",
+            "7",
+            "--directory",
+            "A/./",
+            "--full",
+        ])
+        .expect("valid selector");
+        assert!(
+            matches!(cli.command, Some(Commands::Scan { folder: Some(7), directory: Some(path), full: true }) if path == Path::new("A/./"))
+        );
+        assert!(matches!(
+            Cli::try_parse_from(["suboxide", "scan"])
+                .expect("all roots")
+                .command,
+            Some(Commands::Scan {
+                folder: None,
+                directory: None,
+                full: false
+            })
+        ));
+    }
+
+    #[test]
+    fn scan_command_reports_selection_errors_before_work() {
+        let pool = DbConfig {
+            database_url: ":memory:".into(),
+            max_connections: 1,
+            ..DbConfig::default()
+        }
+        .build_pool()
+        .expect("pool");
+        initialize_database(&mut pool.get().expect("connection")).expect("schema");
+        assert!(matches!(
+            run_scan_command(&pool, None, None, false),
+            Err(ScanError::NoMusicFolders)
+        ));
+        assert!(matches!(
+            run_scan_command(&pool, Some(999), None, false),
+            Err(ScanError::FolderNotFound(_))
+        ));
+        assert!(matches!(
+            run_scan_command(&pool, None, Some("A".into()), false),
+            Err(ScanError::InvalidTarget(_))
+        ));
+        diesel::RunQueryDsl::execute(diesel::sql_query("INSERT INTO music_folders (id, name, path, parent) VALUES (1, 'root', '/root', NULL), (2, 'child', '/root/child', 1)"), &mut pool.get().expect("connection")).expect("folders");
+        assert!(matches!(
+            run_scan_command(&pool, Some(2), None, true),
+            Err(ScanError::FolderNotFound(_))
+        ));
+        assert!(matches!(
+            run_folder_command(&pool, FolderCommands::Remove { id: 2 }),
+            Err(FolderCommandError::NotFound)
+        ));
     }
 }
 
@@ -930,8 +1012,12 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Some(Commands::Scan { folder, full }) => {
-            if let Err(e) = run_scan_command(&pool, folder, full) {
+        Some(Commands::Scan {
+            folder,
+            directory,
+            full,
+        }) => {
+            if let Err(e) = run_scan_command(&pool, folder, directory, full) {
                 tracing::event!(
                     name: "scan.command.failed",
                     tracing::Level::ERROR,

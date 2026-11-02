@@ -126,21 +126,20 @@ impl CustomizeConnection<SqliteConnection, diesel::r2d2::Error> for SqliteConnec
     }
 }
 
-/// Run the SQL migrations to set up the database schema.
+/// Create the current database schema and indexes if they do not exist.
 ///
-/// # Errors
-/// Returns an error if any SQL statement fails while setting up schema or indexes.
+/// Existing databases must already use this schema; alpha schema upgrades are
+/// not performed here.
+pub fn initialize_database(conn: &mut SqliteConnection) -> Result<(), diesel::result::Error> {
+    diesel::sql_query("PRAGMA journal_mode = WAL").execute(conn)?;
+    conn.transaction(initialize_schema)
+}
+
 #[expect(
     clippy::too_many_lines,
-    reason = "Bootstrapping schema and indexes is intentionally centralized"
+    reason = "Existing schema bootstrap is centralized"
 )]
-pub fn run_migrations(conn: &mut SqliteConnection) -> Result<(), diesel::result::Error> {
-    // Enable WAL mode for better concurrent read/write performance
-    // WAL mode allows readers to not block writers and vice versa,
-    // which is important when scanning while serving API requests.
-    // Note: WAL mode is persistent and only needs to be set once per database file.
-    diesel::sql_query("PRAGMA journal_mode = WAL").execute(conn)?;
-
+fn initialize_schema(conn: &mut SqliteConnection) -> Result<(), diesel::result::Error> {
     // Other PRAGMAs (busy_timeout, synchronous, cache_size, foreign_keys, mmap_size)
     // are set per-connection via SqliteConnectionCustomizer in build_pool().
 
@@ -198,11 +197,17 @@ pub fn run_migrations(conn: &mut SqliteConnection) -> Result<(), diesel::result:
             id INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
             name TEXT NOT NULL,
             path TEXT NOT NULL UNIQUE,
+            parent INTEGER REFERENCES music_folders(id) ON DELETE CASCADE,
             enabled BOOLEAN NOT NULL DEFAULT TRUE,
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         ",
+    )
+    .execute(conn)?;
+
+    diesel::sql_query(
+        "CREATE INDEX IF NOT EXISTS idx_music_folders_parent ON music_folders(parent)",
     )
     .execute(conn)?;
 
@@ -223,7 +228,6 @@ pub fn run_migrations(conn: &mut SqliteConnection) -> Result<(), diesel::result:
         ",
     )
     .execute(conn)?;
-    ensure_column(conn, "artists", "search_name TEXT NOT NULL DEFAULT ''")?;
 
     diesel::sql_query("CREATE INDEX IF NOT EXISTS idx_artists_name ON artists(name)")
         .execute(conn)?;
@@ -251,7 +255,6 @@ pub fn run_migrations(conn: &mut SqliteConnection) -> Result<(), diesel::result:
         ",
     )
     .execute(conn)?;
-    ensure_column(conn, "albums", "search_name TEXT NOT NULL DEFAULT ''")?;
 
     diesel::sql_query("CREATE INDEX IF NOT EXISTS idx_albums_name ON albums(name)")
         .execute(conn)?;
@@ -296,7 +299,6 @@ pub fn run_migrations(conn: &mut SqliteConnection) -> Result<(), diesel::result:
         ",
     )
     .execute(conn)?;
-    ensure_column(conn, "songs", "search_name TEXT NOT NULL DEFAULT ''")?;
 
     diesel::sql_query("CREATE INDEX IF NOT EXISTS idx_songs_title ON songs(title)")
         .execute(conn)?;
@@ -690,80 +692,78 @@ pub fn run_migrations(conn: &mut SqliteConnection) -> Result<(), diesel::result:
     )
     .execute(conn)?;
 
-    backfill_search_names(conn)?;
-
-    Ok(())
-}
-
-/// Add a column to an existing table if it is missing (`SQLite` has no
-/// `ADD COLUMN IF NOT EXISTS`).
-fn ensure_column(
-    conn: &mut SqliteConnection,
-    table: &'static str,
-    column_def: &'static str,
-) -> Result<(), diesel::result::Error> {
-    #[derive(diesel::QueryableByName)]
-    struct ColumnInfo {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        name: String,
-    }
-
-    let column_name = column_def
-        .split_whitespace()
-        .next()
-        .expect("column definition starts with a name");
-    let columns: Vec<ColumnInfo> =
-        diesel::sql_query(format!("PRAGMA table_info({table})")).load(conn)?;
-
-    if !columns.iter().any(|column| column.name == column_name) {
-        diesel::sql_query(format!("ALTER TABLE {table} ADD COLUMN {column_def}")).execute(conn)?;
-    }
-
-    Ok(())
-}
-
-/// Fill folded `search_name` values for rows that still have the empty
-/// default (e.g. rows that existed before the column was added).
-fn backfill_search_names(conn: &mut SqliteConnection) -> Result<(), diesel::result::Error> {
-    use crate::db::schema::{albums, artists, songs};
-    use crate::models::music::normalize_search_text;
-
-    let artist_rows: Vec<(i32, String)> = artists::table
-        .filter(artists::search_name.eq(""))
-        .select((artists::id, artists::name))
-        .load(conn)?;
-    for (id, name) in artist_rows {
-        diesel::update(artists::table.find(id))
-            .set(artists::search_name.eq(normalize_search_text(&name)))
-            .execute(conn)?;
-    }
-
-    let album_rows: Vec<(i32, String)> = albums::table
-        .filter(albums::search_name.eq(""))
-        .select((albums::id, albums::name))
-        .load(conn)?;
-    for (id, name) in album_rows {
-        diesel::update(albums::table.find(id))
-            .set(albums::search_name.eq(normalize_search_text(&name)))
-            .execute(conn)?;
-    }
-
-    let song_rows: Vec<(i32, String)> = songs::table
-        .filter(songs::search_name.eq(""))
-        .select((songs::id, songs::title))
-        .load(conn)?;
-    for (id, title) in song_rows {
-        diesel::update(songs::table.find(id))
-            .set(songs::search_name.eq(normalize_search_text(&title)))
-            .execute(conn)?;
-    }
-
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use diesel::connection::SimpleConnection;
+
+    #[test]
+    fn initialization_creates_current_schema_and_preserves_existing_rows() {
+        use crate::db::schema::{music_folders, songs};
+        let mut conn = SqliteConnection::establish(":memory:").expect("connection");
+        conn.batch_execute("PRAGMA foreign_keys = ON")
+            .expect("foreign keys");
+        initialize_database(&mut conn).expect("fresh schema");
+        conn.batch_execute("
+            INSERT INTO music_folders (id, name, path, enabled) VALUES (7, 'offline', '/unavailable-library', FALSE);
+            INSERT INTO music_folders (id, name, path, parent) VALUES (8, 'Album', '/unavailable-library/Album', 7);
+            INSERT INTO songs (id, title, music_folder_id, path, parent_path, content_type, suffix)
+            VALUES (11, 'Track', 8, '/unavailable-library/Album/track.wav', '/unavailable-library/Album', 'audio/wav', 'wav');
+        ").expect("current library");
+        assert!(
+            diesel::sql_query(
+                "INSERT INTO music_folders (name, path, parent) VALUES ('invalid', '/invalid', 999)"
+            )
+            .execute(&mut conn)
+            .is_err()
+        );
+        let folders = music_folders::table
+            .select((
+                music_folders::id,
+                music_folders::path,
+                music_folders::parent,
+                music_folders::enabled,
+            ))
+            .load::<(i32, String, Option<i32>, bool)>(&mut conn)
+            .expect("folder hierarchy");
+        let tracks = songs::table
+            .select((
+                songs::id,
+                songs::music_folder_id,
+                songs::path,
+                songs::search_name,
+            ))
+            .load::<(i32, i32, String, String)>(&mut conn)
+            .expect("direct owners");
+        initialize_database(&mut conn).expect("repeat initialization with offline root");
+        assert_eq!(
+            music_folders::table
+                .select((
+                    music_folders::id,
+                    music_folders::path,
+                    music_folders::parent,
+                    music_folders::enabled
+                ))
+                .load::<(i32, String, Option<i32>, bool)>(&mut conn)
+                .expect("unchanged folders"),
+            folders
+        );
+        assert_eq!(
+            songs::table
+                .select((
+                    songs::id,
+                    songs::music_folder_id,
+                    songs::path,
+                    songs::search_name
+                ))
+                .load::<(i32, i32, String, String)>(&mut conn)
+                .expect("unchanged songs"),
+            tracks
+        );
+    }
 
     #[test]
     fn test_default_config() {

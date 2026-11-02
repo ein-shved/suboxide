@@ -20,6 +20,9 @@ pub enum ScanError {
     #[error("Music folder not found: {0}")]
     FolderNotFound(String),
 
+    #[error("Invalid scan target: {0}")]
+    InvalidTarget(String),
+
     #[error("Scan already in progress")]
     AlreadyScanning,
 
@@ -65,6 +68,14 @@ pub enum ScanMode {
     /// Incremental scan - only scan new or modified files.
     #[default]
     Incremental,
+}
+
+/// A recursive root selection or one directory's direct entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScanTarget {
+    AllEnabled,
+    Root(i32),
+    Directory { root_id: i32, path: PathBuf },
 }
 
 /// Metadata extracted from an audio file.
@@ -114,4 +125,18 @@ pub struct ScanResult {
     pub artists_added: usize,
     pub albums_added: usize,
     pub cover_art_saved: usize,
+}
+
+impl std::ops::AddAssign for ScanResult {
+    fn add_assign(&mut self, other: Self) {
+        self.tracks_found += other.tracks_found;
+        self.tracks_added += other.tracks_added;
+        self.tracks_updated += other.tracks_updated;
+        self.tracks_skipped += other.tracks_skipped;
+        self.tracks_removed += other.tracks_removed;
+        self.tracks_failed += other.tracks_failed;
+        self.artists_added += other.artists_added;
+        self.albums_added += other.albums_added;
+        self.cover_art_saved += other.cover_art_saved;
+    }
 }

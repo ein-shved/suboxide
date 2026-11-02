@@ -6,7 +6,7 @@ use serde::Deserialize;
 use crate::api::auth::SubsonicContext;
 use crate::api::handlers::util;
 use crate::api::response::{ScanStatusData, SubsonicResponse};
-use crate::scanner::{ScanMode, Scanner};
+use crate::scanner::{ScanError, ScanMode, ScanTarget, Scanner};
 
 /// Build a `ScanStatusData` from the current scan state.
 fn build_scan_status_data(auth: &SubsonicContext) -> ScanStatusData {
@@ -27,6 +27,8 @@ fn build_scan_status_data(auth: &SubsonicContext) -> ScanStatusData {
 pub struct StartScanParams {
     /// Whether to re-scan all files regardless of modification time.
     pub full_scan: Option<bool>,
+    pub music_folder_id: Option<i32>,
+    pub directory: Option<String>,
 }
 
 /// GET/POST /rest/startScan[.view]
@@ -51,6 +53,22 @@ pub async fn start_scan(
         return SubsonicResponse::scan_status(auth.format, data).into_response();
     };
 
+    let target = match (params.music_folder_id, params.directory) {
+        (Some(root_id), Some(path)) => ScanTarget::Directory {
+            root_id,
+            path: path.into(),
+        },
+        (Some(root_id), None) => ScanTarget::Root(root_id),
+        (None, None) => ScanTarget::AllEnabled,
+        (None, Some(_)) => return util::missing_param(&auth, "musicFolderId"),
+    };
+    let scanner = Scanner::new(pool);
+    let target = match scanner.resolve_target(target) {
+        Ok(target) => target,
+        Err(ScanError::FolderNotFound(_)) => return util::not_found(&auth, "Music folder"),
+        Err(error) => return util::service_error(&auth, error.to_string()),
+    };
+
     let mode = if params.full_scan.unwrap_or(false) {
         ScanMode::Full
     } else {
@@ -60,9 +78,8 @@ pub async fn start_scan(
     // Spawn background task to run the scan.
     tokio::spawn(async move {
         let result = tokio::task::spawn_blocking(move || {
-            let scanner = Scanner::new(pool);
             let _guard = guard;
-            scanner.scan_all_with_options(Some(&scan_state), mode)
+            scanner.scan(target, mode, Some(&scan_state))
         })
         .await;
 

@@ -189,12 +189,28 @@ impl MusicLibrary {
         MusicFolderRepository::new(self.pool.clone()).find_enabled()
     }
 
+    pub(in crate::api) fn get_music_folder(
+        &self,
+        id: i32,
+    ) -> Result<Option<crate::models::music::MusicFolder>, MusicRepoError> {
+        Ok(MusicFolderRepository::new(self.pool.clone())
+            .find_by_id(id)?
+            .filter(|folder| folder.parent.is_none()))
+    }
+
     // ========================================================================
     // Artists
     // ========================================================================
 
-    pub(in crate::api) fn get_artists(&self) -> Result<Vec<Artist>, MusicRepoError> {
-        ArtistRepository::new(self.pool.clone()).find_all()
+    pub(in crate::api) fn get_artists(
+        &self,
+        root: Option<i32>,
+    ) -> Result<Vec<Artist>, MusicRepoError> {
+        let artists = ArtistRepository::new(self.pool.clone());
+        root.map_or_else(
+            || artists.find_all(),
+            |root| artists.find_by_music_folder(root),
+        )
     }
 
     pub(in crate::api) fn get_artists_by_music_folder(
@@ -256,47 +272,61 @@ impl MusicLibrary {
         &self,
         offset: i64,
         limit: i64,
+        music_folder_id: Option<i32>,
     ) -> Result<Vec<Album>, MusicRepoError> {
-        AlbumRepository::new(self.pool.clone()).find_alphabetical_by_name(offset, limit)
+        AlbumRepository::new(self.pool.clone()).find_alphabetical_by_name(
+            offset,
+            limit,
+            music_folder_id,
+        )
     }
 
     pub(in crate::api) fn get_albums_alphabetical_by_artist(
         &self,
         offset: i64,
         limit: i64,
+        music_folder_id: Option<i32>,
     ) -> Result<Vec<Album>, MusicRepoError> {
-        AlbumRepository::new(self.pool.clone()).find_alphabetical_by_artist(offset, limit)
+        AlbumRepository::new(self.pool.clone()).find_alphabetical_by_artist(
+            offset,
+            limit,
+            music_folder_id,
+        )
     }
 
     pub(in crate::api) fn get_albums_newest(
         &self,
         offset: i64,
         limit: i64,
+        music_folder_id: Option<i32>,
     ) -> Result<Vec<Album>, MusicRepoError> {
-        AlbumRepository::new(self.pool.clone()).find_newest(offset, limit)
+        AlbumRepository::new(self.pool.clone()).find_newest(offset, limit, music_folder_id)
     }
 
     pub(in crate::api) fn get_albums_frequent(
         &self,
         offset: i64,
         limit: i64,
+        music_folder_id: Option<i32>,
     ) -> Result<Vec<Album>, MusicRepoError> {
-        AlbumRepository::new(self.pool.clone()).find_frequent(offset, limit)
+        AlbumRepository::new(self.pool.clone()).find_frequent(offset, limit, music_folder_id)
     }
 
     pub(in crate::api) fn get_albums_recent(
         &self,
         offset: i64,
         limit: i64,
+        music_folder_id: Option<i32>,
     ) -> Result<Vec<Album>, MusicRepoError> {
-        AlbumRepository::new(self.pool.clone()).find_recent(offset, limit)
+        AlbumRepository::new(self.pool.clone()).find_recent(offset, limit, music_folder_id)
     }
 
     pub(in crate::api) fn get_albums_random(
         &self,
         limit: i64,
+        music_folder_id: Option<i32>,
     ) -> Result<Vec<Album>, MusicRepoError> {
-        AlbumRepository::new(self.pool.clone()).find_random(limit)
+        AlbumRepository::new(self.pool.clone()).find_random(limit, music_folder_id)
     }
 
     pub(in crate::api) fn get_albums_by_year(
@@ -305,9 +335,15 @@ impl MusicLibrary {
         to_year: i32,
         offset: i64,
         limit: i64,
+        music_folder_id: Option<i32>,
     ) -> Result<Vec<Album>, MusicRepoError> {
-        AlbumRepository::new(self.pool.clone())
-            .find_by_year_range(from_year, to_year, offset, limit)
+        AlbumRepository::new(self.pool.clone()).find_by_year_range(
+            from_year,
+            to_year,
+            offset,
+            limit,
+            music_folder_id,
+        )
     }
 
     pub(in crate::api) fn get_albums_by_genre(
@@ -315,8 +351,9 @@ impl MusicLibrary {
         genre: &str,
         offset: i64,
         limit: i64,
+        music_folder_id: Option<i32>,
     ) -> Result<Vec<Album>, MusicRepoError> {
-        AlbumRepository::new(self.pool.clone()).find_by_genre(genre, offset, limit)
+        AlbumRepository::new(self.pool.clone()).find_by_genre(genre, offset, limit, music_folder_id)
     }
 
     pub(in crate::api) fn get_albums_starred(
@@ -324,9 +361,14 @@ impl MusicLibrary {
         user_id: i32,
         offset: i64,
         limit: i64,
+        music_folder_id: Option<i32>,
     ) -> Result<Vec<Album>, MusicRepoError> {
-        let starred = StarredRepository::new(self.pool.clone())
-            .get_starred_albums_paginated(user_id, offset, limit)?;
+        let starred = StarredRepository::new(self.pool.clone()).get_starred_albums_paginated(
+            user_id,
+            offset,
+            limit,
+            music_folder_id,
+        )?;
         Ok(starred.into_iter().map(|(album, _)| album).collect())
     }
 
@@ -335,9 +377,14 @@ impl MusicLibrary {
         user_id: i32,
         offset: i64,
         limit: i64,
+        music_folder_id: Option<i32>,
     ) -> Result<Vec<Album>, MusicRepoError> {
-        let album_ids = RatingRepository::new(self.pool.clone())
-            .get_highest_rated_album_ids(user_id, offset, limit)?;
+        let album_ids = RatingRepository::new(self.pool.clone()).get_highest_rated_album_ids(
+            user_id,
+            offset,
+            limit,
+            music_folder_id,
+        )?;
 
         if album_ids.is_empty() {
             return Ok(vec![]);

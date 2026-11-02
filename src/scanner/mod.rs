@@ -10,4 +10,4 @@ pub use engine::{AutoScanHandle, AutoScanner, Scanner};
 #[doc(inline)]
 pub use state::{ScanPhase, ScanState, ScanStateHandle};
 #[doc(inline)]
-pub use types::{ScanError, ScanMode, ScanResult, ScannedTrack};
+pub use types::{ScanError, ScanMode, ScanResult, ScanTarget, ScannedTrack};

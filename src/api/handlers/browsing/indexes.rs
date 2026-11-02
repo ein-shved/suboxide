@@ -20,6 +20,7 @@ use crate::models::music::{
 pub struct IndexesParams {
     /// Only return data if the library changed since this time (epoch millis).
     pub if_modified_since: Option<i64>,
+    pub music_folder_id: Option<i32>,
 }
 
 /// Resolve the library lastModified time in epoch millis: the latest of the
@@ -92,7 +93,7 @@ pub async fn get_indexes(
                 });
             }
 
-            let artists = blocking_auth.music().get_artists()?;
+            let artists = blocking_auth.music().get_artists(params.music_folder_id)?;
             let user_id = blocking_auth.user.id;
 
             // Get starred status for all artists in a single batch query
@@ -150,7 +151,7 @@ pub async fn get_artists(
         move || -> Result<ArtistsID3Response, crate::db::MusicRepoError> {
             let last_modified = library_last_modified(&blocking_auth)?;
 
-            let artists = blocking_auth.music().get_artists()?;
+            let artists = blocking_auth.music().get_artists(params.music_folder_id)?;
             let user_id = blocking_auth.user.id;
 
             // Get album counts for all artists in a single batch query

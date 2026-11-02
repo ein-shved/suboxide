@@ -30,26 +30,50 @@ fn albums_for_list_type(
     offset: i64,
 ) -> Result<Vec<Album>, ApiError> {
     let albums = match list_type {
-        "random" => auth.music().get_albums_random(size),
-        "newest" => auth.music().get_albums_newest(offset, size),
-        "frequent" => auth.music().get_albums_frequent(offset, size),
-        "recent" => auth.music().get_albums_recent(offset, size),
-        "alphabeticalByName" => auth.music().get_albums_alphabetical_by_name(offset, size),
-        "alphabeticalByArtist" => auth.music().get_albums_alphabetical_by_artist(offset, size),
+        "random" => auth.music().get_albums_random(size, params.music_folder_id),
+        "newest" => auth
+            .music()
+            .get_albums_newest(offset, size, params.music_folder_id),
+        "frequent" => auth
+            .music()
+            .get_albums_frequent(offset, size, params.music_folder_id),
+        "recent" => auth
+            .music()
+            .get_albums_recent(offset, size, params.music_folder_id),
+        "alphabeticalByName" => {
+            auth.music()
+                .get_albums_alphabetical_by_name(offset, size, params.music_folder_id)
+        }
+        "alphabeticalByArtist" => {
+            auth.music()
+                .get_albums_alphabetical_by_artist(offset, size, params.music_folder_id)
+        }
         "byYear" => {
             let from_year = params.from_year.unwrap_or(0);
             let to_year = params.to_year.unwrap_or(9999);
-            auth.music()
-                .get_albums_by_year(from_year, to_year, offset, size)
+            auth.music().get_albums_by_year(
+                from_year,
+                to_year,
+                offset,
+                size,
+                params.music_folder_id,
+            )
         }
         "byGenre" => {
             let Some(genre) = params.genre.as_deref() else {
                 return Err(ApiError::MissingParameter("genre".into()));
             };
-            auth.music().get_albums_by_genre(genre, offset, size)
+            auth.music()
+                .get_albums_by_genre(genre, offset, size, params.music_folder_id)
         }
-        "starred" => auth.music().get_albums_starred(auth.user.id, offset, size),
-        "highest" => auth.music().get_albums_highest(auth.user.id, offset, size),
+        "starred" => {
+            auth.music()
+                .get_albums_starred(auth.user.id, offset, size, params.music_folder_id)
+        }
+        "highest" => {
+            auth.music()
+                .get_albums_highest(auth.user.id, offset, size, params.music_folder_id)
+        }
         _ => {
             return Err(ApiError::Generic(format!("Unknown list type: {list_type}")));
         }

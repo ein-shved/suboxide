@@ -114,6 +114,7 @@ impl From<MusicRepoError> for ApiError {
         match error.kind() {
             MusicRepoErrorKind::NotFound => Self::NotFound(error.message().to_string()),
             MusicRepoErrorKind::AlreadyExists
+            | MusicRepoErrorKind::InvalidInput
             | MusicRepoErrorKind::Database
             | MusicRepoErrorKind::Pool => Self::Generic(error.to_string()),
         }

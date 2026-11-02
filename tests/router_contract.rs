@@ -12,7 +12,7 @@ use axum::extract::Request;
 use axum::http::{Method, StatusCode, header};
 use suboxide::app::{AppState, CorsConfig, create_router};
 use suboxide::crypto::password::hash_password;
-use suboxide::db::{DbConfig, DbPool, NewUser, UserRepository, run_migrations};
+use suboxide::db::{DbConfig, DbPool, NewUser, UserRepository, initialize_database};
 use suboxide::lastfm::LastFmClient;
 use tower::ServiceExt;
 
@@ -29,12 +29,12 @@ fn temp_db_path() -> String {
     path
 }
 
-/// Build a migrated database pool with an admin user `t` (password `t`).
+/// Build a initialized database pool with an admin user `t` (password `t`).
 fn test_pool() -> DbPool {
     let config = DbConfig::new(temp_db_path());
     let pool = config.build_pool().expect("pool must build");
     let mut conn = pool.get().expect("connection must be available");
-    run_migrations(&mut conn).expect("migrations must run");
+    initialize_database(&mut conn).expect("schema must initialize");
 
     // Admin user with a known subsonic password.
     let password_hash = hash_password("t").expect("password must hash");

@@ -216,6 +216,7 @@ impl StarredRepository {
         user_id: i32,
         offset: i64,
         limit: i64,
+        music_folder_id: Option<i32>,
     ) -> Result<Vec<(Album, NaiveDateTime)>, MusicRepoError> {
         let mut conn = self.pool.get()?;
 
@@ -223,6 +224,12 @@ impl StarredRepository {
             .inner_join(albums::table.on(starred::album_id.eq(albums::id.nullable())))
             .filter(starred::user_id.eq(user_id))
             .filter(starred::album_id.is_not_null())
+            .filter(
+                starred::album_id.eq_any(
+                    super::music::album_query(&mut conn, music_folder_id)?
+                        .select(albums::id.nullable()),
+                ),
+            )
             .select((StarredRow::as_select(), AlbumRow::as_select()))
             .order(starred::starred_at.desc())
             .offset(offset)
@@ -896,12 +903,19 @@ impl RatingRepository {
         user_id: i32,
         offset: i64,
         limit: i64,
+        music_folder_id: Option<i32>,
     ) -> Result<Vec<i32>, MusicRepoError> {
         let mut conn = self.pool.get()?;
 
         let results: Vec<i32> = user_ratings::table
             .filter(user_ratings::user_id.eq(user_id))
             .filter(user_ratings::album_id.is_not_null())
+            .filter(
+                user_ratings::album_id.eq_any(
+                    super::music::album_query(&mut conn, music_folder_id)?
+                        .select(albums::id.nullable()),
+                ),
+            )
             .filter(user_ratings::rating.gt(0))
             .select(user_ratings::album_id)
             .order(user_ratings::rating.desc())

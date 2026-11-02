@@ -135,7 +135,7 @@ impl BookmarkRepository {
 mod tests {
     use super::BookmarkRepository;
     use crate::db::schema::{music_folders, songs, users};
-    use crate::db::{DbConfig, DbPool, run_migrations};
+    use crate::db::{DbConfig, DbPool, initialize_database};
     use diesel::prelude::*;
 
     fn test_pool() -> DbPool {
@@ -145,8 +145,8 @@ mod tests {
             ..DbConfig::default()
         };
         let pool = config.build_pool().expect("pool must build");
-        run_migrations(&mut pool.get().expect("connection must checkout"))
-            .expect("migrations must run");
+        initialize_database(&mut pool.get().expect("connection must checkout"))
+            .expect("schema must initialize");
         pool
     }
 

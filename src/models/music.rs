@@ -303,6 +303,7 @@ pub struct MusicFolder {
     pub id: i32,
     pub name: String,
     pub path: String,
+    pub parent: Option<i32>,
     pub enabled: bool,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
@@ -1822,6 +1823,7 @@ mod directory_tests {
     #[test]
     fn directory_response_from_music_folder_uses_folder_as_root() {
         let folder = MusicFolder {
+            parent: None,
             id: 3,
             name: "Library".to_string(),
             path: "/music".to_string(),
