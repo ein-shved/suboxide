@@ -50,3 +50,13 @@ independently updated parts of the library.
 - THEN each affected album's track list, track count, and duration reflect
   the updated indexed collection
 - AND indexed tracks in the other part remain available
+
+## REQ-004: FLAC+CUE listening
+
+Listeners must be able to select and listen to individual tracks of a FLAC album image with an external CUE sheet.
+
+### Scenario: Listen to a CUE track
+
+- WHEN a listener opens an indexed FLAC album with an external CUE sheet
+- THEN the album shows its individual tracks
+- AND selecting a track plays that track with approximate start and end points

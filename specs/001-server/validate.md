@@ -133,3 +133,79 @@
   incremental `AllEnabled` through `Scanner::scan`; CLI/API use that route
   with the selected target and mode. Every retained entry point reaches
   the same per-directory reconciliation boundary.
+
+### Check: CUE indexing and audio delivery
+
+- Covers: [REQ-004](requirements.md#req-004-flaccue-listening).
+  [CUE contracts](system.md#subsystem-flaccue-tracks).
+- Method: Scan distinguishable-audio FLAC+CUE fixtures using fixed and
+  variable frame numbering, aligned and mid-frame INDEX 01 times, final EOF,
+  and a sample rate not divisible by 75. Include conflicting/missing tags,
+  different track performers, and artwork. Fetch each stream, download,
+  and album/artist/playlist ZIP entry; decode with test-only
+  `nix develop --command ffmpeg` and compare PCM to source whole-frame
+  intervals chosen by the shared ceiling cuts. Compare compressed subframe
+  payload bytes; inspect output metadata, frame numbering, and CRCs. Compare
+  HTTP ranges to complete-output slices and inspect lengths and filenames.
+  Compare each song's API size with its complete virtual output length.
+  On independent fixture copies, substitute equal-length bytes before a
+  selected track or inside its stored byte interval, restoring the indexed
+  precise mtime. Request that track, including a narrow Range.
+- Evidence: One song per track, no image duplicate, expected tags/artwork, and
+  one album despite differing performers; durations match selected frames. All media
+  decode to the same selected PCM, adjacent cuts are shared, and the last
+  reaches EOF. Compressed payloads are unchanged; numbering is rebased,
+  CRCs and STREAMINFO sample count are valid, MD5 is zero, and the source
+  SEEKTABLE is absent. Virtual lengths/ranges and song sizes agree; track
+  names use song track numbers. Damage before the selected interval does
+  not affect delivery; damage inside it is rejected before any audio response.
+
+### Check: CUE lifecycle and source resolution
+
+- Covers: [CUE contracts](system.md#subsystem-flaccue-tracks).
+  [REQ-002](requirements.md#req-002-partial-library-updates).
+  [REQ-003](requirements.md#req-003-shared-album-integrity).
+- Method: Full/incremental rescan unchanged pairs, then update only their
+  directory after CUE tags/boundaries/track-set and image changes; retain
+  sibling/child songs and shared-album members in another root. Inspect rows
+  and typed source/track boundaries. Inject collapsed/empty rounded intervals, out-of-source
+  bounds, unreadable sources, and indexing failures; compare indexed state.
+  Mutate an image and request media before rescan. Remove sheet, restore
+  the pair, then remove image; exercise incomplete listings. Request
+  ordinary/CUE stream, download, and
+  ZIP from configured and disabled roots, then with source paths outside all
+  roots. Inspect disk audio files and runtime dependency declarations;
+  run the packaged scanner/server without FFmpeg on PATH.
+- Evidence: Same CUE path/track-number identities retain IDs; changed and
+  removed tracks reconcile only the selected scope. Shared album members,
+  counts, and durations agree. Failures preserve indexed state and report
+  errors; incomplete listings do not remove unproven absences. Changed source
+  fingerprints yield no audio until rescan.
+  Sheet removal restores the ordinary image song; proven image absence
+  removes its CUE songs. No additional audio files or FFmpeg runtime dependency
+  appear. Packaged scanning/delivery works without FFmpeg. Authorized media
+  works, including disabled-root tracks; outside-root sources yield no audio.
+
+### Check: CUE relational publication
+
+- Covers: [CUE contracts](system.md#subsystem-flaccue-tracks).
+- Method: Inspect SQLite table and index definitions for typed source
+  fingerprints, track ordinal/byte intervals, and song references. Attempt
+  invalid source fingerprints, empty or negative intervals, duplicate
+  source/number pairs, duplicate song references and duplicate ordinary
+  paths. Publish conflicting image owners or mismatched song paths, owners,
+  track numbers and audio properties. Inject a publication failure; compare
+  all three tables. Swap images between two retained sheets, change track
+  sets, and remove direct songs and registered roots. Inspect foreign keys,
+  source/track/song IDs and personal references after each committed update.
+  Inspect media resolution's transaction and native parser entry point.
+- Evidence: SQL rejects invalid constrained values and duplicate identities.
+  Publication rejects inconsistent or competing owners and rolls back as
+  one unit. Image exchanges commit with deferred references; retained
+  sheet/number identities retain source, track and song IDs and personal
+  references. Removal leaves no dangling references or unreferenced CUE
+  tracks/sources. Only source metadata and track boundaries persist.
+  Media reads song, track and source in one transaction, uses song path,
+  direct owner and audio properties, and verifies the opened fingerprint
+  before and after parsing only the selected byte interval. Parsed frame
+  counts match the stored ordinal interval, including for narrow Range.
